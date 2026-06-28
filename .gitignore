@@ -1,0 +1,26 @@
+# --- secrets — NEVER commit ---
+.env
+.env.*
+*.env
+.env.mazi
+
+# --- python ---
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# --- editor / backup snapshots ---
+*.bak*
+backups/
+
+# --- runtime logs / output ---
+logs/
+*.log
+*.out
+
+# --- symlink into the sibling whatnot-sniper-m4 repo (do not commit) ---
+mazi_db
+
+# --- large internal review image artifact (potential private content) ---
+static/backfill_reject_contact_sheet.jpg

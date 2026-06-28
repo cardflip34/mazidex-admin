@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MaziDex Workbench (private)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css?v=20260625-identified-all-v1">
+</head>
+<body class="density-standard">
+<div class="shell">
+
+  <!-- ===== HEADER ===== -->
+  <header class="header" role="banner">
+    <div class="brand">
+      <div class="logo" aria-label="MaziDex logo">
+        <span class="m">M</span><span class="a">A</span><span class="z">Z</span><span class="i">I</span><span class="dex">DEX</span>
+      </div>
+      <span class="tagline">Workbench &middot; Private Review</span>
+    </div>
+    <div class="search" role="search">
+      <input id="filterSearch" type="search" placeholder="Filter loaded rows by title / player / seller…" autocomplete="off">
+    </div>
+    <div class="status-strip">
+      <span class="status-pill"><span class="dot"></span> <span id="dbPill">db …</span></span>
+      <span class="status-pill is-write" id="writePill"><span class="dot"></span> Write DRY-RUN</span>
+      <div class="density-picker" role="radiogroup" aria-label="Tile density">
+        <button class="density-btn is-active" data-density="standard" type="button" role="radio" aria-checked="true" title="Standard — readable tiles">Standard</button>
+        <button class="density-btn" data-density="tiny" type="button" role="radio" aria-checked="false" title="Tiny — dense scan grid">Tiny</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===== SAFETY BANNER ===== -->
+  <div class="safety-banner" role="alert">
+    <span class="sb-chip sb-internal">INTERNAL REVIEW ONLY</span>
+    <span class="sb-chip">NOT TRUSTED</span>
+    <span class="sb-chip">NOT MAZIFIED</span>
+    <span class="sb-chip">NOT PUBLIC READY</span>
+    <span class="sb-chip">NOT VALUATION SAFE</span>
+    <span class="sb-chip sb-write" id="writeBanner">WRITE DRY-RUN / WRITES DISABLED</span>
+  </div>
+
+  <!-- ===== HEADER STATS ===== -->
+  <section class="hero-stats" id="heroStats" aria-label="Workbench index stats">
+    <div class="hero-stat" title="Trusted + Pending rows visible to the workbench.">
+      <div class="hero-stat-val" id="statTotal">—</div>
+      <div class="hero-stat-label">Public Records Index</div>
+      <div class="hero-stat-sub">Trusted + Pending</div>
+    </div>
+    <div class="hero-stat">
+      <div class="hero-stat-val" id="statVolume">—</div>
+      <div class="hero-stat-label">Total Volume</div>
+      <div class="hero-stat-sub">Trusted Historical</div>
+    </div>
+    <div class="hero-stat">
+      <div class="hero-stat-val" id="statAvg">—</div>
+      <div class="hero-stat-label">Avg Sale</div>
+      <div class="hero-stat-sub">Trusted Historical</div>
+    </div>
+    <div class="hero-stat">
+      <div class="hero-stat-val" id="statHigh">—</div>
+      <div class="hero-stat-label">Daily High</div>
+      <div class="hero-stat-sub">Last 24h</div>
+    </div>
+  </section>
+
+  <!-- ===== PRIMARY NAV (Sources) ===== -->
+  <nav class="primary-nav" id="sourceNav" role="tablist" aria-label="Sources">
+    <button class="tab is-active" role="tab" aria-selected="true"  data-source="identified">
+      <span class="tab-label">Identified</span>
+      <span class="tab-count" data-count-for="identified">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false"  data-source="trusted">
+      <span class="tab-label">Trusted</span>
+      <span class="tab-count" data-count-for="trusted">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="mazified">
+      <span class="tab-label">Mazified Review</span>
+      <span class="tab-count" data-count-for="mazified">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="flagged_review">
+      <span class="tab-label">Flagged Review</span>
+      <span class="tab-count" data-count-for="flagged_review">—</span>
+    </button>
+    <button class="tab tab-pending" role="tab" aria-selected="false" data-source="working_queue">
+      <span class="tab-label">Pending Review</span>
+      <span class="tab-count" data-count-for="working_queue">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="ebay">
+      <span class="tab-label">eBay</span>
+      <span class="tab-count" data-count-for="ebay">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="goldin">
+      <span class="tab-label">Goldin</span>
+      <span class="tab-count" data-count-for="goldin">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="fanatics">
+      <span class="tab-label">Fanatics</span>
+      <span class="tab-count" data-count-for="fanatics">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="heritage">
+      <span class="tab-label">Heritage</span>
+      <span class="tab-count" data-count-for="heritage">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="pwcc">
+      <span class="tab-label">PWCC</span>
+      <span class="tab-count" data-count-for="pwcc">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="vdex_discovery" hidden>
+      <span class="tab-label">VDEX Discovery</span>
+      <span class="tab-count" data-count-for="vdex_discovery">—</span>
+    </button>
+  </nav>
+
+  <!-- ===== REVIEW SUBNAV (shown for Working Queue source) ===== -->
+  <nav class="review-subnav" id="reviewSubnav" role="tablist" aria-label="Review queues" hidden>
+    <button class="rtab is-active" data-queue="working">All Reasons <span class="count" data-count="working">—</span></button>
+    <button class="rtab" data-queue="high_value">High Value Price View <span class="count" data-count="high_value">—</span></button>
+    <button class="rtab" data-queue="proof_review">Proof Review <span class="count" data-count="proof_review">—</span></button>
+    <button class="rtab" data-queue="needs_identity">Needs Identity <span class="count" data-count="needs_identity">—</span></button>
+    <button class="rtab" data-queue="needs_better_image">Needs Better Image <span class="count" data-count="needs_better_image">—</span></button>
+    <button class="rtab" data-queue="capture_review">Capture Review <span class="count" data-count="capture_review">—</span></button>
+    <button class="rtab" data-queue="interstitial_carry_forward">Interstitial / Carry-Forward <span class="count" data-count="interstitial_carry_forward">—</span></button>
+    <button class="rtab" data-queue="chrome_advanced">Chrome Advanced <span class="count" data-count="chrome_advanced">—</span></button>
+    <button class="rtab" data-queue="human_review_ai_approved">Human Review AI Approved <span class="count" data-count="human_review_ai_approved">—</span></button>
+    <button class="rtab" data-queue="rejected_hidden">Rejected / Hidden <span class="count" data-count="rejected_hidden">—</span></button>
+  </nav>
+  <div class="queue-view-note" id="queueViewNote" hidden>
+    Tabs are review filters/views. Rows can appear in more than one view; High Value is price metadata only.
+  </div>
+
+  <!-- ===== CATEGORY CHIPS ===== -->
+  <div class="subnav" id="catNav" role="tablist" aria-label="Categories">
+    <button class="subtab is-active" data-cat="all">All</button>
+    <button class="subtab" data-cat="sports">Sports</button>
+    <button class="subtab" data-cat="basketball">Basketball</button>
+    <button class="subtab" data-cat="football">Football</button>
+    <button class="subtab" data-cat="baseball">Baseball</button>
+    <button class="subtab" data-cat="hockey">Hockey</button>
+    <button class="subtab" data-cat="soccer">Soccer</button>
+    <button class="subtab" data-cat="ufc">UFC</button>
+    <button class="subtab" data-cat="wnba">WNBA</button>
+    <button class="subtab subtab-pokemon" data-cat="pokemon">Pokemon</button>
+    <button class="subtab subtab-veefriends" data-cat="veefriends">VeeFriends</button>
+    <button class="subtab" data-cat="slabs">Slabs</button>
+    <button class="subtab" data-cat="raw">Raw</button>
+    <button class="subtab" data-cat="autos">Autos</button>
+    <button class="subtab" data-cat="rookies">Rookies</button>
+  </div>
+
+  <!-- ===== GRID ===== -->
+  <main id="grid" class="grid"></main>
+
+  <!-- ===== DRAWER ===== -->
+  <div id="drawer" class="drawer hidden" aria-hidden="true">
+    <button id="drawer-close" class="drawer-close" aria-label="Close">&times;</button>
+    <div id="drawer-content" class="drawer-content">loading…</div>
+  </div>
+
+  <!-- ===== FOOTER ===== -->
+  <footer class="footbar">
+    <span id="footer-status">ready</span>
+    <span id="img-stats" class="muted">images: 0 ok &middot; 0 fail</span>
+    <span class="muted" id="footer-write-state">read-only v0 &middot; decision writes disabled &middot; POST returns 503 dry-run echo</span>
+  </footer>
+
+</div>
+
+<script src="/static/app.js?v=20260625-identified-all-v1" defer></script>
+</body>
+</html>
