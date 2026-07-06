@@ -685,6 +685,7 @@ function gradeViewHtml(row, marketComps, selectedGroup) {
     ${gradePriceHeaderHtml(row, subset, selectedGroup)}
     ${marketChartHtml(row, subset)}
     ${valuationPanelHtml(subset)}
+    ${audioCalloutHtml(row)}
     ${externalSummaryHtml(subset)}`;
 }
 
@@ -1080,6 +1081,129 @@ function externalSummaryHtml(marketComps) {
   `;
 }
 
+// Audio callout (advisory) — the spoken auction-call transcript + audio-derived
+// identity captured for THIS sale, rendered directly above external sold comps.
+// ADVISORY ONLY: image identity always wins and this bar NEVER promotes Trusted /
+// Mazified / public (upstream trust_gate_effect=none). Internal file paths are
+// deliberately not surfaced. Reads the monolith audio shape:
+//   row.audio_transcript = { text_excerpt, duration, model, segments, ... }
+//   row.audio_ocr        = { player, brand, set_name, parallel, year, serial,
+//                            grade_value, grade_company, evidence_snippets[] }
+//   row.audio_reconciliation = { verified_source, final_confidence, match_score }
+//   row.audio_evidence_status = "verified" | ...
+// The extractor's CURRENT_CARD isolation fix landed in commit 6d383bb at
+// 2026-07-01 13:31:45 -0700; audio identities processed before this moment came
+// from the pre-fix multi-card extractor (measured ~80% wrong-card on the
+// suddendeath canary) and get a warning cue.
+const AUDIO_ISOLATION_FIX_EPOCH = Date.parse('2026-07-01T20:31:45+00:00');
+
+function audioCalloutHtml(row) {
+  const asObj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
+  const tr = asObj(row.audio_transcript);
+  const ocr = asObj(row.audio_ocr);
+  const recon = asObj(row.audio_reconciliation);
+  const excerpt = String(tr.text_excerpt || row.audio_transcript_excerpt || '').trim();
+  const snippets = (Array.isArray(ocr.evidence_snippets) ? ocr.evidence_snippets : [])
+    .map((s) => String(s || '').trim()).filter(Boolean);
+  const verifiedSource = String(recon.verified_source || '').trim();
+  const confidence = recon.final_confidence != null && recon.final_confidence !== ''
+    ? String(recon.final_confidence) : '';
+  // Upstream job-completion status says "verified"; relabel so a bare trust
+  // word never sits next to audio-only identity (canonical-labels hygiene).
+  const rawStatus = String(
+    row.audio_evidence_status || asObj(row.audio_evidence).status || ''
+  ).trim();
+  const status = rawStatus === 'verified' ? 'complete' : rawStatus;
+
+  if (row.audio_link_suspect) {
+    const deltaS = Number(row.audio_link_delta_seconds || 0);
+    const deltaLabel = deltaS >= 3600 ? `${(deltaS / 3600).toFixed(1)}h` : `${Math.round(deltaS)}s`;
+    return `
+    <section class="bbg-card">
+      <h3>Audio callout <span class="bbg-advisory-tag">advisory · image wins</span></h3>
+      <div class="bbg-audio-suspect">AUDIO LINK SUSPECT — the recorded clip was bound from a different sale (auction number recycled ${escapeHtml(deltaLabel)} apart). Transcript and audio identity are suppressed as likely wrong-card evidence.</div>
+    </section>`;
+  }
+
+  const idRows = [
+    ['audio player', ocr.player],
+    ['audio brand', ocr.brand],
+    ['audio set', ocr.set_name],
+    ['audio parallel', ocr.parallel],
+    ['audio year', ocr.year],
+    ['audio serial', ocr.serial],
+    ['audio grade', ocr.grade_value || ocr.grade_company],
+  ].filter(([, v]) => v != null && String(v).trim() !== '');
+
+  const hasAudio = Boolean(excerpt || snippets.length || idRows.length || verifiedSource || status);
+
+  if (!hasAudio) {
+    return `
+    <section class="bbg-card">
+      <h3>Audio callout <span class="bbg-advisory-tag">advisory</span></h3>
+      <div class="bbg-empty-state small">No audio callout captured for this sale. Audio evidence is advisory only — captured card image identity always wins.</div>
+    </section>`;
+  }
+
+  const sourceLabel = ({
+    both_agree: 'audio confirms image identity',
+    both_disagree_image_won: 'audio disagrees — image wins',
+    audio_only: 'audio only (no image identity to check)',
+    image_only: 'image only (audio gave no identity)',
+    neither: 'no identity isolated',
+  })[verifiedSource] || verifiedSource;
+
+  const metaBits = [
+    sourceLabel ? `reconcile: ${escapeHtml(sourceLabel)}` : '',
+    confidence ? `confidence: ${escapeHtml(confidence)}` : '',
+    status ? `job: ${escapeHtml(status)}` : '',
+    tr.duration ? `clip: ${escapeHtml(String(tr.duration))}s` : '',
+  ].filter(Boolean).join(' · ');
+
+  // Per-field reconciliation chips: which audio tags CONFIRMED the Gemini image
+  // identity, which CONFLICTED (image wins), and which the audio FILLED because
+  // the row's image identity (card_ocr + api_scan) is blank. Computed
+  // index-side (audio_evidence_sidecar._field_tags) against the row's CURRENT
+  // image identity — never derived client-side, so a field the image already
+  // carries can never be mislabeled as an audio fill.
+  const FIELD_NAMES = { player: 'player', brand: 'brand', set_name: 'set', parallel: 'parallel', year: 'year', serial: 'serial', grade_value: 'grade', grade_company: 'grader' };
+  const fieldLabel = (f) => FIELD_NAMES[f] || String(f);
+  const tags = asObj(row.audio_field_tags);
+  const chipBits = [
+    ...(Array.isArray(tags.confirmed) ? tags.confirmed : []).map((f) =>
+      `<span class="bbg-audio-chip agree" title="audio and image identity agree on this field">✓ ${escapeHtml(fieldLabel(f))} confirmed</span>`),
+    ...(Array.isArray(tags.conflicts) ? tags.conflicts : []).filter((c) => c && c.field).map((c) =>
+      `<span class="bbg-audio-chip conflict" title="image identity wins; audio heard a different value">✕ ${escapeHtml(fieldLabel(c.field))}: image “${escapeHtml(String(c.image_value ?? '—'))}” wins · audio heard “${escapeHtml(String(c.audio_value ?? '—'))}”</span>`),
+    ...Object.entries(asObj(tags.filled)).map(([f, v]) =>
+      `<span class="bbg-audio-chip fill" title="image identity is blank for this field; audio supplies the only candidate — advisory fill only">+ ${escapeHtml(fieldLabel(f))}: “${escapeHtml(String(v))}” filled by audio (image blank)</span>`),
+  ];
+  const reconChips = chipBits.length
+    ? `<div class="bbg-audio-chips">${chipBits.join('')}</div>`
+    : '';
+
+  const processedEpoch = Date.parse(String(row.audio_processed_at || '').replace(/Z$/, '+00:00'));
+  const preFixCue = Number.isFinite(processedEpoch) && processedEpoch < AUDIO_ISOLATION_FIX_EPOCH
+    ? '<div class="bbg-audio-prefix-cue">pre-isolation-fix extract — this identity came from the old multi-card extractor and may describe a neighboring card from the same clip</div>'
+    : '';
+
+  const snippetHtml = snippets.length
+    ? `<div class="bbg-context-list">${snippets.slice(0, 6).map((s) =>
+        `<div class="bbg-context-row"><small>${escapeHtml(s)}</small></div>`).join('')}</div>`
+    : '';
+
+  return `
+    <section class="bbg-card">
+      <h3>Audio callout <span class="bbg-advisory-tag">advisory · image wins</span></h3>
+      ${metaBits ? `<div class="bbg-note">${metaBits}</div>` : ''}
+      ${preFixCue}
+      ${reconChips}
+      ${excerpt ? `<div class="bbg-audio-excerpt">${escapeHtml(excerpt)}</div>` : ''}
+      ${idRows.length ? `<div class="meta kv">${kvRows(idRows)}</div>` : ''}
+      ${snippetHtml}
+      <p class="bbg-note">Advisory only. Spoken auction-call transcript is internal evidence; it never promotes Trusted / Mazified / public identity.</p>
+    </section>`;
+}
+
 function rawDataHtml(row) {
   const safe = JSON.stringify(row, null, 2);
   return `
@@ -1440,26 +1564,99 @@ function sourceShortLabel(row) {
   return 'SOURCE UNKNOWN';
 }
 
-function tileAdmitHtml(row, index = 0) {
+// ── Row-action policy + bar (APPROVE / SWAP FRONT / DELETE) ───────────────
+// docs/MAZIDEX_8504_ROW_ACTIONS_PLAN.md. The positional cap that hid APPROVE
+// past the 100th rendered tile is GONE. All three backends have shipped
+// (Phase 2 pending-promote, Phase 3 soft-hide+archive DELETE, Phase 4 SWAP
+// FRONT rebind), so the full 3-button bar is LIVE. Every button still renders
+// 'locked' until the scoped write gate opens (isScoped in tileActionPolicy),
+// and the server re-checks review_write_enabled()+row_actions_write_enabled()
+// on every POST → the bar ships inert until the operator opens the gate.
+const ROW_ACTIONS_V1 = true;
+
+// Pure, unit-tested in tests/row_actions_tests.js. Returns the per-row state of
+// each button: 'enabled' | 'locked' | 'hidden' | 'approved'. No DOM, no STATE,
+// no index → APPROVE can never again be capped by render position.
+function tileActionPolicy(row, opts) {
+  opts = opts || {};
+  const observed = String(row && row.observed_in || '').toLowerCase();
+  const isIdentified = observed === 'identified';
+  const isPending = observed === 'pending';
+  const inActionScope = isIdentified || isPending; // bar shows on identified + pending only
   const sourceKey = String(row && row.source_key || '').trim();
-  const scopeKeys = Array.isArray(STATE.health && STATE.health.review_write_scope_source_keys)
-    ? STATE.health.review_write_scope_source_keys.map(String)
-    : [];
-  const allIdentified = !!(STATE.health && STATE.health.review_write_scope_identified_all === true);
-  const isIdentified = String(row && row.observed_in || '').toLowerCase() === 'identified';
-  const isScoped = STATE.writeEnabled === true
-    && ((allIdentified && isIdentified) || (sourceKey && scopeKeys.includes(sourceKey)));
-  const approvedLocal = row && row.__approved === true;
-  const showOption = isIdentified && index < 100;
-  if (!showOption && !approvedLocal) return '';
-  if (approvedLocal) {
-    return `<button type="button" class="tile-admit-btn is-approved" disabled title="${escapeAttr('Approved into Trusted Review')}">APPROVED</button>`;
+  const scopeKeys = Array.isArray(opts.scopeKeys) ? opts.scopeKeys.map(String) : [];
+  const isScoped = opts.writeEnabled === true
+    && (((opts.identifiedAll === true) && isIdentified) || (sourceKey && scopeKeys.includes(sourceKey)));
+  const approvedLocal = !!(row && row.__approved === true);
+
+  let approve;
+  if (approvedLocal) approve = 'approved';
+  else if (!inActionScope) approve = 'hidden';
+  else if (isPending && opts.pendingApproveEnabled !== true) approve = 'locked'; // Phase 2 backend
+  else if (!isScoped) approve = 'locked';
+  else approve = 'enabled';
+
+  let swapFront;
+  if (!inActionScope) swapFront = 'hidden';                       // never on trusted
+  else if (opts.swapFrontEnabled !== true) swapFront = 'locked';  // Phase 4 backend
+  else swapFront = isScoped ? 'enabled' : 'locked';
+
+  let del;
+  if (!inActionScope) del = 'hidden';
+  else if (opts.deleteEnabled !== true) del = 'locked';           // Phase 3 backend
+  else del = isScoped ? 'enabled' : 'locked';
+
+  return { approve: approve, swapFront: swapFront, delete: del };
+}
+
+// Read the live write-gate + phase flags out of STATE for the renderer.
+function tileActionOpts() {
+  const h = STATE.health || {};
+  return {
+    writeEnabled: STATE.writeEnabled === true,
+    identifiedAll: h.review_write_scope_identified_all === true,
+    scopeKeys: Array.isArray(h.review_write_scope_source_keys) ? h.review_write_scope_source_keys.map(String) : [],
+    pendingApproveEnabled: true,  // Phase 2 backend SHIPPED (pending → Trusted promotion)
+    deleteEnabled: true,          // Phase 3 backend SHIPPED (soft-hide + 6TB archive)
+    swapFrontEnabled: true,       // Phase 4 backend SHIPPED (next-best front rebind)
+  };
+}
+
+function approveBtnHtml(state) {
+  if (state === 'hidden') return '';
+  if (state === 'approved') {
+    return `<button type="button" class="tile-admit-btn tile-act tile-act-approve is-approved" disabled title="${escapeAttr('Approved into Trusted Review')}">APPROVED</button>`;
   }
-  const disabled = !isScoped;
-  const title = disabled
+  const locked = state !== 'enabled';
+  const title = locked
     ? 'Approve option visible. Open the scoped write gate for this exact source_key to enable.'
-    : 'Approve this Identified row into private Trusted Review';
-  return `<button type="button" class="tile-admit-btn${disabled ? ' is-locked' : ''}" ${disabled ? 'disabled' : ''} title="${escapeAttr(title)}">APPROVE</button>`;
+    : 'Approve this row into private Trusted Review';
+  return `<button type="button" class="tile-admit-btn tile-act tile-act-approve${locked ? ' is-locked' : ''}" ${locked ? 'disabled' : ''} title="${escapeAttr(title)}">APPROVE</button>`;
+}
+
+function actStubBtnHtml(kind, state, label, lockedTitle, liveTitle) {
+  if (state === 'hidden') return '';
+  const locked = state !== 'enabled';
+  return `<button type="button" class="tile-act ${kind}${locked ? ' is-locked' : ''}" ${locked ? 'disabled' : ''} title="${escapeAttr(locked ? lockedTitle : liveTitle)}">${label}</button>`;
+}
+
+function tileAdmitHtml(row, index = 0) {
+  const policy = tileActionPolicy(row, tileActionOpts());
+  if (!ROW_ACTIONS_V1) {
+    // Legacy surface preserved: APPROVE on identified rows only (positional cap
+    // removed) plus the sticky APPROVED state. The staged bar stays dark.
+    if (policy.approve === 'approved') return approveBtnHtml('approved');
+    if (String(row && row.observed_in || '').toLowerCase() !== 'identified') return '';
+    return approveBtnHtml(policy.approve);
+  }
+  if (policy.approve === 'hidden' && policy.swapFront === 'hidden' && policy.delete === 'hidden') return '';
+  const swapHtml = actStubBtnHtml('tile-act-swap', policy.swapFront, 'SWAP FRONT',
+    'Swap front — rebinds the next-best front frame from disk (ships in a later phase).',
+    'Rebind the next-best front image from disk');
+  const delHtml = actStubBtnHtml('tile-act-delete', policy.delete, 'DELETE',
+    'Delete — removes this card from 8504 and archives its images (ships in a later phase).',
+    'Remove this card from 8504 and archive its images');
+  return `<div class="tile-action-bar">${approveBtnHtml(policy.approve)}${swapHtml}${delHtml}</div>`;
 }
 
 function tileHtml(row, index = 0) {
@@ -2317,6 +2514,15 @@ async function postDecision(compId, decision, row) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+    // fetchJson parses non-2xx JSON bodies, so branch on the body (same pattern
+    // as SWAP FRONT / DELETE). A server rejection — e.g. trusted_gate_blocked:*
+    // from the promotion hard-block gate — must NOT render as a success or the
+    // row silently reappears after reload with no explanation.
+    if (j && j.error) {
+      $('#footer-status').textContent =
+        `${decision} REJECTED for ${row.source_key || compId}: ${j.error}${j.reason ? ' — ' + j.reason : ''}${j.message ? ' — ' + j.message : ''}`;
+      return;
+    }
     $('#footer-status').textContent =
       `posted ${decision} → event_id ${j.event_id || '(dry-run)'}`;
     if (decision === 'confirm' && row && String(row.observed_in || '').toLowerCase() === 'identified') {
@@ -2330,6 +2536,83 @@ async function postDecision(compId, decision, row) {
     await loadCurrentView();
   } catch (e) {
     $('#footer-status').textContent = `decision err: ${e.message}`;
+  }
+}
+
+// SWAP FRONT (Phase 4): POST the source_key to the swap-front route, which runs
+// the out-of-process engine (next-best front rebind, never verified, never a
+// promotion). `confirm: true` is required server-side for a real (writing) swap;
+// the route re-checks the write gate and returns 503 when it is closed. On a
+// committed swap we reload the view so the freshly-bound front image shows.
+async function rowActionSwapFront(sourceKey, btn) {
+  const prevText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'SWAPPING'; }
+  const reenable = () => { if (btn) { btn.disabled = false; btn.textContent = prevText; } };
+  try {
+    const j = await fetchJson('/api/v1/row-action/swap-front', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source_key: sourceKey, confirm: true }),
+    });
+    if (j && j.error) {
+      $('#footer-status').textContent =
+        `swap ${sourceKey}: ${j.error}${j.message ? ' — ' + j.message : ''}`;
+      reenable();
+      return;
+    }
+    const status = String(j && j.status || '');
+    if (status === 'swapped') {
+      $('#footer-status').textContent = `SWAP FRONT committed for ${sourceKey} — new front bound`;
+      if (btn) btn.textContent = 'SWAPPED';
+      await loadCurrentView();
+    } else if (status === 'no_alternate_front_available') {
+      $('#footer-status').textContent =
+        `swap ${sourceKey}: no alternate front frame on disk — nothing changed`;
+      reenable();
+    } else {
+      $('#footer-status').textContent = `swap ${sourceKey}: ${status || 'unknown result'}`;
+      reenable();
+    }
+  } catch (e) {
+    $('#footer-status').textContent = `swap err: ${e.message}`;
+    reenable();
+  }
+}
+
+// DELETE (Phase 3): soft-hide the row (reversible via a later `clear`) and
+// archive its images. The route is gated CLOSED by default; a closed gate
+// returns 503 with an `error` field (fetchJson parses non-2xx JSON, so we branch
+// on the body, not the HTTP status). On success we optimistically drop the row
+// from the current page, mirroring the APPROVE flow.
+async function rowActionDelete(sourceKey, btn) {
+  const prevText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'DELETING'; }
+  const reenable = () => { if (btn) { btn.disabled = false; btn.textContent = prevText; } };
+  try {
+    const j = await fetchJson('/api/v1/row-action/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source_key: sourceKey, reason: 'operator_8504_delete' }),
+    });
+    if (j && j.error) {
+      $('#footer-status').textContent =
+        `delete ${sourceKey}: ${j.error}${j.message ? ' — ' + j.message : ''}`;
+      reenable();
+      return;
+    }
+    if (String(j && j.status || '') === 'deleted_from_8504') {
+      $('#footer-status').textContent = `DELETED ${sourceKey} from 8504 — reversible via clear`;
+      STATE.rows = STATE.rows.filter((r) => String(r.source_key || '') !== sourceKey);
+      STATE.visible = STATE.visible.filter((r) => String(r.source_key || '') !== sourceKey);
+      renderGrid();
+      await loadCounts();
+    } else {
+      $('#footer-status').textContent = `delete ${sourceKey}: ${j && j.status || 'unknown result'}`;
+      reenable();
+    }
+  } catch (e) {
+    $('#footer-status').textContent = `delete err: ${e.message}`;
+    reenable();
   }
 }
 
@@ -2352,6 +2635,45 @@ document.addEventListener('click', (ev) => {
     admitBtn.disabled = true;
     admitBtn.textContent = 'APPROVING';
     postDecision(row.comp_id, 'confirm', row);
+    return;
+  }
+  const swapBtn = ev.target.closest('.tile-act-swap');
+  if (swapBtn) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (swapBtn.disabled) return;
+    const tile = swapBtn.closest('.tile');
+    const sourceKey = tile ? tile.dataset.sourceKey || '' : '';
+    if (!sourceKey) {
+      $('#footer-status').textContent = 'swap err: no source_key on tile';
+      return;
+    }
+    const ok = window.confirm(
+      `SWAP FRONT for\n${sourceKey}?\n\n` +
+      'Rebinds the next-best front frame from disk and re-stamps it with the ' +
+      'auction number. It never marks the card verified and never promotes it. ' +
+      'If no alternate front frame exists this is a no-op.');
+    if (!ok) return;
+    rowActionSwapFront(sourceKey, swapBtn);
+    return;
+  }
+  const delBtn = ev.target.closest('.tile-act-delete');
+  if (delBtn) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (delBtn.disabled) return;
+    const tile = delBtn.closest('.tile');
+    const sourceKey = tile ? tile.dataset.sourceKey || '' : '';
+    if (!sourceKey) {
+      $('#footer-status').textContent = 'delete err: no source_key on tile';
+      return;
+    }
+    const ok = window.confirm(
+      `DELETE from 8504\n${sourceKey}?\n\n` +
+      'Soft-hides this card from the workbench and archives its images. ' +
+      'It is reversible via a later clear. This removes it from the current view.');
+    if (!ok) return;
+    rowActionDelete(sourceKey, delBtn);
     return;
   }
   const src = ev.target.closest('#sourceNav .tab');
