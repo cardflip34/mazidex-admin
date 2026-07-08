@@ -268,6 +268,36 @@ _QR_NEEDS_BETTER_IMAGE = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Soft-hide exclusion (8504 row actions, Phase 3a).
+#
+# A row whose LATEST review decision is one of HIDDEN_DECISIONS is removed from
+# every 8504 work surface + count. review_decision_events is append-only, so the
+# exclusion keys off the *latest* decision per source_key (DISTINCT ON ... ORDER
+# BY created_at DESC, id DESC) -- exactly the review_decisions_latest semantics.
+# That makes DELETE reversible: a later 'clear' event becomes the latest decision
+# and the row reappears (a plain "ever hidden" subquery could never un-hide).
+#
+# HIDDEN_EXCLUSION is a bare predicate (no leading AND/WHERE). Every query that
+# embeds it reads from an UNALIASED primary relation, so bare `source_key`
+# resolves to the outer row.
+# ---------------------------------------------------------------------------
+HIDDEN_DECISIONS: tuple[str, ...] = (
+    "rejected_from_public_path",
+    "hidden_from_work_queue",
+    "deleted_from_8504",
+)
+_HIDDEN_DECISIONS_SQL_IN = ", ".join(f"'{d}'" for d in HIDDEN_DECISIONS)
+HIDDEN_EXCLUSION = (
+    "source_key NOT IN (\n"
+    "          SELECT le.source_key FROM (\n"
+    "              SELECT DISTINCT ON (source_key) source_key, decision\n"
+    "              FROM review_decision_events\n"
+    "              ORDER BY source_key, created_at DESC, id DESC\n"
+    "          ) le\n"
+    f"          WHERE le.decision IN ({_HIDDEN_DECISIONS_SQL_IN})\n"
+    "      )"
+)
 
 
 WORKING_QUEUE_SQL = f"""
@@ -283,10 +313,7 @@ WORKING_QUEUE_SQL = f"""
               'FLAG_REVIEW', 'RAW_ONLY', 'TRUSTED_CANDIDATE',
               'REVIEW_HIGH_VALUE'
           )
-      AND source_key NOT IN (
-          SELECT DISTINCT source_key FROM review_decision_events
-          WHERE decision IN ('rejected_from_public_path', 'hidden_from_work_queue')
-      )
+      AND {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -303,6 +330,7 @@ HIGH_VALUE_SQL = f"""
     -- workflow bucket and not a Mazified eligibility gate. queue_reason
     -- surfaces the price tier so operators can sub-filter inside the view.
     WHERE COALESCE(sold_price, 0) >= 100
+      AND {HIDDEN_EXCLUSION}
     ORDER BY sold_price DESC NULLS LAST, last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -338,6 +366,7 @@ PROOF_REVIEW_SQL = f"""
         OR lower(COALESCE(raw->>'_review_reason', '')) LIKE '%%popup%%'
         OR lower(COALESCE(raw->>'_review_reason', '')) LIKE '%%not-card%%'
     )
+      AND {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -355,6 +384,7 @@ NEEDS_IDENTITY_SQL = f"""
         OR (pending_reasons ? 'LOW_CONFIDENCE')
         OR (pending_reasons ? 'UNIDENTIFIED_WITH_IMAGE')
     )
+      AND {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -372,6 +402,7 @@ NEEDS_BETTER_IMAGE_SQL = f"""
         OR (pending_reasons ? 'FRONT_IMAGE_STREAM_STILL')
         OR (pending_reasons ? 'CDN_ONLY')
     )
+      AND {HIDDEN_EXCLUSION}
     ORDER BY COALESCE(sold_price, 0) DESC, last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -382,6 +413,7 @@ CAPTURE_REVIEW_SQL = f"""
     SELECT {ROW_FIELDS}, 'capture_review_pending' AS queue_reason
     FROM operational_pending_sales
     WHERE pending_reasons ? 'CAPTURE_REVIEW'
+      AND {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -395,6 +427,7 @@ INTERSTITIAL_CARRY_FORWARD_SQL = f"""
         COALESCE(raw ->> 'capture_class', '') = 'unsubstantiated'
         OR COALESCE(raw ->> 'auction_number_match', '') = 'no_overlay_number'
       )
+      AND {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -434,6 +467,7 @@ MAZIFIED_SQL = f"""
     SELECT {ROW_FIELDS}
     FROM operational_feed_sales
     WHERE review_decision = 'mazified'
+      AND {HIDDEN_EXCLUSION}
     ORDER BY reviewed_at DESC NULLS LAST, last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -444,6 +478,7 @@ FLAGGED_REVIEW_SQL = f"""
     FROM operational_pending_sales
     WHERE jsonb_typeof(raw -> 'risk_flags') = 'array'
       AND jsonb_array_length(raw -> 'risk_flags') > 0
+      AND {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -467,6 +502,7 @@ REJECTED_HIDDEN_SQL = f"""
 TRUSTED_VIEW_SQL = f"""
     SELECT {ROW_FIELDS}
     FROM stage1_trusted_sales_current
+    WHERE {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -474,6 +510,7 @@ TRUSTED_VIEW_SQL = f"""
 IDENTIFIED_VIEW_SQL = f"""
     SELECT {ROW_FIELDS}, 'identified_front_gemini_sweep' AS queue_reason
     FROM identified_sales_current
+    WHERE {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -636,17 +673,14 @@ def _working_queue_sql(sort: str | None, watermarked_only: bool) -> str:
     SELECT {ROW_FIELDS}
     FROM operational_pending_sales
     WHERE trust_bucket IN ('FLAG_REVIEW', 'RAW_ONLY', 'TRUSTED_CANDIDATE', 'REVIEW_HIGH_VALUE')
-      AND source_key NOT IN (
-          SELECT DISTINCT source_key FROM review_decision_events
-          WHERE decision IN ('rejected_from_public_path', 'hidden_from_work_queue')
-      )
+      AND {HIDDEN_EXCLUSION}
 {wm_filter}    ORDER BY {order_by}
     LIMIT %s
 """
 
 
 def _trusted_view_sql(sort: str | None, watermarked_only: bool) -> str:
-    wm_filter = f"    WHERE {_WATERMARKED_IMAGE_PREDICATE}\n" if watermarked_only else ""
+    wm_filter = f"      AND {_WATERMARKED_IMAGE_PREDICATE}\n" if watermarked_only else ""
     if sort == "watermarked_newest":
         order_by = _watermark_order_sql()
     elif sort == "oldest":
@@ -660,6 +694,7 @@ def _trusted_view_sql(sort: str | None, watermarked_only: bool) -> str:
     return f"""
     SELECT {ROW_FIELDS}
     FROM stage1_trusted_sales_current
+    WHERE {HIDDEN_EXCLUSION}
 {wm_filter}    ORDER BY {order_by}
     LIMIT %s
 """
@@ -955,25 +990,25 @@ EXTERNAL_COUNTS_SQL = """
 # ============================================================================
 # Whatnot per-tab counts (unchanged)
 # ============================================================================
-QUEUE_COUNTS_SQL = """
+QUEUE_COUNTS_SQL = f"""
     SELECT 'identified_view' AS name, COUNT(*) AS n
     FROM identified_sales_current
+    WHERE {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'working' AS name, COUNT(*) AS n
     FROM operational_pending_sales
     WHERE trust_bucket IN ('FLAG_REVIEW','RAW_ONLY','TRUSTED_CANDIDATE','REVIEW_HIGH_VALUE')
-      AND source_key NOT IN (
-        SELECT DISTINCT source_key FROM review_decision_events
-        WHERE decision IN ('rejected_from_public_path','hidden_from_work_queue')
-      )
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'high_value', COUNT(*)
     FROM operational_pending_sales
     WHERE COALESCE(sold_price,0) >= 100
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'proof_review', COUNT(*)
     FROM operational_pending_sales
-    WHERE (raw ->> 'proof_binding_status') IN (
+    WHERE (
+       (raw ->> 'proof_binding_status') IN (
         'unknown_unreadable','mismatch_neighboring_auction','multiple_auction_numbers'
     )
        OR pending_reasons ?| ARRAY[
@@ -992,24 +1027,33 @@ QUEUE_COUNTS_SQL = """
        OR lower(COALESCE(raw->>'_review_reason', '')) LIKE '%multi-card%'
        OR lower(COALESCE(raw->>'_review_reason', '')) LIKE '%popup%'
        OR lower(COALESCE(raw->>'_review_reason', '')) LIKE '%not-card%'
+    )
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'needs_identity', COUNT(*)
     FROM operational_pending_sales
-    WHERE COALESCE(player,'') = ''
+    WHERE (
+       COALESCE(player,'') = ''
        OR COALESCE(title,'') = ''
        OR lower(COALESCE(title,'')) = 'whatnot live capture'
+    )
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'needs_better_image', COUNT(*)
     FROM operational_pending_sales
-    WHERE COALESCE(raw ->> 'front_image_status', '') IN ('stream_still','missing','unknown','interstitial')
+    WHERE (
+       COALESCE(raw ->> 'front_image_status', '') IN ('stream_still','missing','unknown','interstitial')
        OR (raw ->> 'back_image_status') = 'missing'
        OR (pending_reasons ? 'FRONT_IMAGE_MISSING')
        OR (pending_reasons ? 'FRONT_IMAGE_STREAM_STILL')
        OR (pending_reasons ? 'CDN_ONLY')
+    )
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'capture_review', COUNT(*)
     FROM operational_pending_sales
     WHERE pending_reasons ? 'CAPTURE_REVIEW'
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'interstitial_carry_forward', COUNT(*)
     FROM operational_pending_sales
@@ -1018,6 +1062,7 @@ QUEUE_COUNTS_SQL = """
         COALESCE(raw ->> 'capture_class', '') = 'unsubstantiated'
         OR COALESCE(raw ->> 'auction_number_match', '') = 'no_overlay_number'
       )
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'chrome_advanced', COUNT(*)
     FROM (
@@ -1047,6 +1092,7 @@ QUEUE_COUNTS_SQL = """
     FROM operational_pending_sales
     WHERE jsonb_typeof(raw -> 'risk_flags') = 'array'
       AND jsonb_array_length(raw -> 'risk_flags') > 0
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'rejected_hidden', COUNT(*)
     FROM (
@@ -1057,4 +1103,5 @@ QUEUE_COUNTS_SQL = """
     WHERE latest.decision IN ('rejected_from_public_path','hidden_from_work_queue')
     UNION ALL
     SELECT 'trusted_view', COUNT(*) FROM stage1_trusted_sales_current
+    WHERE {HIDDEN_EXCLUSION}
 """

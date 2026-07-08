@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Operator-approved 2026-07-03 (fleet-wide audio rollout).
+
+     Rebuilds the 8504 advisory-audio index (data/audio_by_comp_id.json) from the
+     whatnot_auctions.json master so the AUDIO CALLOUT drawer bar sees newly fused
+     transcripts. Read-only w.r.t. the master; atomic index replace; the running
+     8504 server picks the new index up automatically via mtime (no restart).
+
+     Every 4h (not more often): build_index json.load's the ~1.4GB master
+     (multi-GB transient RAM) and the M4 fleet runs under a RAM/swap cap;
+     Nice/LowPriorityIO keep it out of the capture fleet's way. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mazi.audio-sidecar-regen</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/stavrosaim4/mazidex-admin/venv/bin/python3</string>
+    <string>/Users/stavrosaim4/mazidex-admin/audio_evidence_sidecar.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/stavrosaim4/mazidex-admin</string>
+  <key>StartInterval</key>
+  <integer>14400</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/stavrosaim4/Library/Logs/mazi/audio_sidecar_regen.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/stavrosaim4/Library/Logs/mazi/audio_sidecar_regen.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+</dict>
+</plist>

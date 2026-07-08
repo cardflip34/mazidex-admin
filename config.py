@@ -61,6 +61,22 @@ def review_write_scope_identified_all() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def row_actions_write_enabled() -> bool:
+    """Dedicated runtime gate for 8504 row-action writes (DELETE soft-hide,
+    SWAP FRONT).
+
+    Independent of the Confirm Identified->Trusted promotion scope so the
+    row-action surface can be rolled out under its own controlled flip. The
+    DELETE / SWAP routes require BOTH review_write_enabled() AND this flag, so
+    the routes ship completely inert until an operator explicitly opens this
+    gate (fail-closed; default off). Migration 019 must be applied first or the
+    DB CHECK rejects `deleted_from_8504` / `front_swapped`.
+    """
+    return os.environ.get(
+        "MAZIDEX_ADMIN_ROW_ACTIONS_WRITE_ENABLED", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Backward-compatible snapshot for older imports. New code should call
 # review_write_enabled() so health, UI copy, and POST behavior agree.
 REVIEW_WRITE_ENABLED = review_write_enabled()
@@ -81,6 +97,14 @@ VALID_DECISIONS = frozenset({
     "deny",
     "rejected_from_public_path",
     "hidden_from_work_queue",
+    # 8504 row-action decisions (Phase 3a). Recognized by the payload
+    # validator so the generic decision endpoint returns a friendly
+    # `unmapped_semantic_decision` 422, but intentionally NOT in
+    # decisions.DB_VALID_DECISIONS -- these are written only by their
+    # dedicated routes (DELETE soft-hide, SWAP FRONT) which own the
+    # keep-one-image / JSONL / image-swap side effects.
+    "deleted_from_8504",
+    "front_swapped",
     # Legacy 9009 decision types (preserved for parity)
     "confirm",
     "flag",

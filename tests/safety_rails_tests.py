@@ -23,6 +23,7 @@ sys.path.insert(0, ROOT)
 
 from decisions import (
     DB_VALID_DECISIONS,
+    _ROW_ACTION_ONLY_DECISIONS,
     UNMAPPED_SEMANTIC_DECISIONS,
     is_db_supported_decision,
     mazified_blockers,
@@ -72,8 +73,8 @@ check(
     f"is_db_supported_decision('mazified')={is_db_supported_decision('mazified')}",
 )
 check(
-    "T1e DB_VALID_DECISIONS is exactly the 7-value strict set",
-    DB_VALID_DECISIONS == frozenset({"confirm","flag","reject","workable","clear","mazified","deny"}),
+    "T1e DB_VALID_DECISIONS is the 7 generic + deleted_from_8504 row-action",
+    DB_VALID_DECISIONS == frozenset({"confirm","flag","reject","workable","clear","mazified","deny","deleted_from_8504"}),
     f"DB_VALID_DECISIONS={sorted(DB_VALID_DECISIONS)}",
 )
 
@@ -288,8 +289,13 @@ check(
     f"state={mazified_button_state(clean_row)}",
 )
 check(
-    "T6b clean row -> all 7 DB decisions allowed",
-    set(row_allowed_decisions(clean_row)) == DB_VALID_DECISIONS,
+    "T6b clean row -> all generic DB decisions allowed (row-action-only excluded)",
+    set(row_allowed_decisions(clean_row)) == (DB_VALID_DECISIONS - _ROW_ACTION_ONLY_DECISIONS),
+    f"allowed={row_allowed_decisions(clean_row)}",
+)
+check(
+    "T6c deleted_from_8504 is row-action-only, never in the generic per-row menu",
+    "deleted_from_8504" not in set(row_allowed_decisions(clean_row)),
     f"allowed={row_allowed_decisions(clean_row)}",
 )
 

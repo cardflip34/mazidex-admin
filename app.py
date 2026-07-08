@@ -57,6 +57,7 @@ from config import (
     review_write_scope_test_run_id,
     review_write_scope_identified_all,
     review_write_enabled,
+    row_actions_write_enabled,
 )
 from decisions import (
     DB_VALID_DECISIONS,
@@ -73,8 +74,15 @@ from decisions import (
 )
 from promotion import (
     promote_identified_to_trusted,
+    promote_pending_to_trusted,
     refresh_stage1_views,
     watermark_inventory,
+)
+from row_actions import (
+    append_delete_record,
+    build_delete_record,
+    pick_deletable_row,
+    soft_delete_payload,
 )
 from queues import (
     DECISIONS_SQL,
@@ -97,6 +105,11 @@ from safety import (
     extract_basename,
     privacy_scan_payload,
 )
+
+# Advisory-audio bridge: Neon carries no audio, so attach the monolith-derived
+# transcript excerpt + audio identity onto the drawer row by comp_id (read-only,
+# advisory-only, never promotes trust). See audio_evidence_sidecar.py.
+from audio_evidence_sidecar import attach_audio as attach_audio_evidence
 
 # Neon connection (read-only by default)
 from mazi_db.connection import conn as neon_conn
@@ -681,6 +694,15 @@ def _proof_only_basename(value: Any) -> bool:
     return bn.startswith(("review_proof_", "proof_"))
 
 
+def _cdn_basename(value: Any) -> bool:
+    """True if the ref is a CDN/listing image. Standing gate: CDN/listing images
+    are never display or proof evidence, so they must never resolve as a front."""
+    if not value:
+        return False
+    s = str(value).strip().strip('"').lower()
+    return "/cdn_" in s or os.path.basename(s).startswith("cdn_")
+
+
 def _apply_effective_publish_safety(row: dict[str, Any]) -> None:
     """Apply read-surface safety overrides without mutating source rows."""
     cert = str(row.get("mazi_cert_status") or "").strip().strip('"').lower()
@@ -928,6 +950,78 @@ def _apply_canonical_descriptor_shape(row: dict[str, Any]) -> None:
     }
 
 
+def _resolve_display_images(row: dict[str, Any]) -> None:
+    """Resolve the browser-facing image URLs from the already-shaped row.
+
+    Browsers receive only relative 8504 proxy URLs; the server-side proxy fetches
+    private R2 / 9008 / local roots. Front display priority (standing gate): captured
+    card_ front -> stamped _mazi -> recovered ops_display_image -> suppress. CDN and
+    proof_ basenames are never a valid front: they force the recovery fallback, and
+    if nothing recoverable exists the tile is suppressed rather than showing CDN.
+    """
+    official_front_basename = extract_basename(
+        row.get("image_front_neon_url"),
+        row.get("image_front"),
+    )
+    ops_display_image_value = ""
+    for candidate in (
+        row.get("ops_display_image"),
+        row.get("review_context_image"),
+        row.get("review_context_image_first"),
+    ):
+        if candidate and not _proof_only_basename(candidate) and not _cdn_basename(candidate):
+            ops_display_image_value = candidate
+            break
+    row["ops_display_image_basename"] = extract_basename(ops_display_image_value)
+    if not row.get("ops_display_image") and ops_display_image_value:
+        row["ops_display_image"] = ops_display_image_value
+        row["ops_display_image_source"] = row.get("ops_display_image_source") or "raw_fallback"
+        row["ops_display_image_status"] = row.get("ops_display_image_status") or "review_only_existing_row"
+    row["image_front_is_ops_display"] = False
+    row["image_front_basename"] = official_front_basename
+    if _proof_only_basename(row["image_front_basename"]):
+        row["proof_only_front_blocked"] = True
+        row["blocked_front_basename"] = row["image_front_basename"]
+        row["image_front_basename"] = ""
+        row["front_image_status"] = row.get("front_image_status") or "missing"
+    elif _cdn_basename(row["image_front_basename"]):
+        row["cdn_only_front_blocked"] = True
+        row["blocked_front_basename"] = row["image_front_basename"]
+        row["image_front_basename"] = ""
+        row["front_image_status"] = row.get("front_image_status") or "cdn_suppressed"
+    if not row["image_front_basename"] and row["ops_display_image_basename"]:
+        row["image_front_basename"] = row["ops_display_image_basename"]
+        row["image_front_is_ops_display"] = True
+    row["ops_display_back_image_basename"] = extract_basename(row.get("ops_display_back_image"))
+    row["image_back_basename"] = extract_basename(
+        row.get("image_back_neon_url"),
+        row.get("image_back"),
+        row.get("ops_display_back_image_basename"),
+    )
+    proof_bn = row.get("review_proof_basename") or row.get("original_proof_basename")
+    if isinstance(proof_bn, str) and proof_bn.startswith('"') and proof_bn.endswith('"'):
+        proof_bn = proof_bn.strip('"')
+    row["image_proof_basename"] = extract_basename(proof_bn) if proof_bn else ""
+
+    # Build the front URL from the RESOLVED basename only. Deriving it from the raw
+    # image_front(_neon_url) here would re-surface a CDN/proof value that the block
+    # above deliberately blanked, defeating the suppression.
+    row["image_front_url"] = best_image_url(row.get("image_front_basename"))
+    row["image_back_url"] = best_image_url(
+        row.get("image_back_neon_url"),
+        row.get("image_back"),
+        row.get("image_back_basename"),
+    )
+    row["image_proof_url"] = best_image_url(row.get("image_proof_basename"))
+
+    if (
+        str(row.get("observed_in") or "").lower() == "identified"
+        and row.get("image_front_url")
+        and not row.get("image_front_is_ops_display")
+    ):
+        row["front_image_status"] = "displayable_for_review"
+
+
 def _shape_row(raw_tuple: tuple, columns: list[str]) -> dict[str, Any]:
     """Convert a psycopg row + column names into a privacy-scrubbed dict."""
     row = dict(zip(columns, raw_tuple))
@@ -1018,67 +1112,7 @@ def _shape_row(raw_tuple: tuple, columns: list[str]) -> dict[str, Any]:
         row.pop(k, None)
 
     # ---- Image URL resolution ----------------------------------------------
-    # Browsers receive only relative 8504 proxy URLs. The server-side proxy can
-    # fetch private R2, 9008, or a configured local root without requiring the
-    # QA browser to reach 9008 directly.
-    official_front_basename = extract_basename(
-        row.get("image_front_neon_url"),
-        row.get("image_front"),
-    )
-    ops_display_image_value = ""
-    for candidate in (
-        row.get("ops_display_image"),
-        row.get("review_context_image"),
-        row.get("review_context_image_first"),
-        row.get("cdn_image"),
-    ):
-        if candidate and not _proof_only_basename(candidate):
-            ops_display_image_value = candidate
-            break
-    row["ops_display_image_basename"] = extract_basename(ops_display_image_value)
-    if not row.get("ops_display_image") and ops_display_image_value:
-        row["ops_display_image"] = ops_display_image_value
-        row["ops_display_image_source"] = row.get("ops_display_image_source") or "raw_fallback"
-        row["ops_display_image_status"] = row.get("ops_display_image_status") or "review_only_existing_row"
-    row["image_front_is_ops_display"] = False
-    row["image_front_basename"] = official_front_basename
-    if _proof_only_basename(row["image_front_basename"]):
-        row["proof_only_front_blocked"] = True
-        row["blocked_front_basename"] = row["image_front_basename"]
-        row["image_front_basename"] = ""
-        row["front_image_status"] = row.get("front_image_status") or "missing"
-    if not row["image_front_basename"] and row["ops_display_image_basename"]:
-        row["image_front_basename"] = row["ops_display_image_basename"]
-        row["image_front_is_ops_display"] = True
-    row["ops_display_back_image_basename"] = extract_basename(row.get("ops_display_back_image"))
-    row["image_back_basename"] = extract_basename(
-        row.get("image_back_neon_url"),
-        row.get("image_back"),
-        row.get("ops_display_back_image_basename"),
-    )
-    proof_bn = row.get("review_proof_basename") or row.get("original_proof_basename")
-    if isinstance(proof_bn, str) and proof_bn.startswith('"') and proof_bn.endswith('"'):
-        proof_bn = proof_bn.strip('"')
-    row["image_proof_basename"] = extract_basename(proof_bn) if proof_bn else ""
-
-    row["image_front_url"] = best_image_url(
-        row.get("image_front_neon_url"),
-        row.get("image_front"),
-        row.get("image_front_basename"),
-    )
-    row["image_back_url"] = best_image_url(
-        row.get("image_back_neon_url"),
-        row.get("image_back"),
-        row.get("image_back_basename"),
-    )
-    row["image_proof_url"] = best_image_url(row.get("image_proof_basename"))
-
-    if (
-        str(row.get("observed_in") or "").lower() == "identified"
-        and row.get("image_front_url")
-        and not row.get("image_front_is_ops_display")
-    ):
-        row["front_image_status"] = "displayable_for_review"
+    _resolve_display_images(row)
 
     # Force decimals to floats and datetimes to ISO strings via deep_scrub
     return deep_scrub(row)
@@ -1874,6 +1908,9 @@ def row_detail(
         chosen["mazified_blockers"] = mazified_blockers(chosen)
         chosen["hard_block_strip"] = row_hard_block_labels(chosen)
         chosen["market_comps"] = _market_comps_for_row(chosen)
+        # Advisory audio (transcript excerpt + audio-derived identity) for the
+        # AUDIO CALLOUT drawer bar. No-op when the row has no indexed audio.
+        attach_audio_evidence(chosen)
         chosen["row_lookup"] = {
             "requested": requested_identity,
             "resolved":  resolved_identity,
@@ -2120,7 +2157,19 @@ async def review_decision(request: Request) -> JSONResponse:
     try:
         with neon_conn() as c:
             if decision == "confirm":
-                result = promote_identified_to_trusted(c, body)
+                # Try Identified->Trusted first; if the row isn't in Identified,
+                # fall back to the Pending->Trusted gate (watermark + single-card
+                # + identity, no cert). The Identified attempt does no writes
+                # before raising not_in_identified_state (only an idempotent
+                # schema-ensure commit + a SELECT), so the connection is clean
+                # for the fallback. The pending gate self-enforces eligibility.
+                try:
+                    result = promote_identified_to_trusted(c, body)
+                except ValueError as identified_exc:
+                    if str(identified_exc) == "not_in_identified_state":
+                        result = promote_pending_to_trusted(c, body)
+                    else:
+                        raise
             else:
                 return _json(
                     {
@@ -2160,6 +2209,382 @@ async def review_decision(request: Request) -> JSONResponse:
             {"error": "internal_error", "type": type_name},
             status_code=500,
         )
+
+
+# ============================================================================
+# 8504 row actions — DELETE soft-hide (Phase 3a)
+# ============================================================================
+@app.post("/api/v1/row-action/delete")
+async def row_action_delete(request: Request) -> JSONResponse:
+    """8504 DELETE row action — Phase 3a soft-hide (reversible; NO bytes moved).
+
+    Appends a `deleted_from_8504` event through the single write_decision INSERT
+    path, keeps exactly ONE image with the row (resolve_keep_one_image), and
+    writes a JSONL audit line. DELETE is scoped to identified + pending rows
+    only; trusted/feed/mazified rows are rejected (409). The physical 6TB
+    archive and any local unlink are Phase 3b (env MAZI_DELETE_ARCHIVE_V1) —
+    nothing here deletes image bytes.
+
+    Reversible: a later `clear` event un-hides the row (queues.py latest-decision
+    exclusion). Gated CLOSED by default behind BOTH MAZIDEX_ADMIN_REVIEW_WRITE_ENABLED
+    and MAZIDEX_ADMIN_ROW_ACTIONS_WRITE_ENABLED; migration 019 must be applied or
+    the DB CHECK rejects the decision (surfaced as 422).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"error": "malformed_json"}, status_code=400)
+
+    source_key = str(body.get("source_key") or "").strip()
+    if not source_key:
+        return _json({"error": "missing_source_key"}, status_code=400)
+    reason = body.get("reason")
+    operator = str(body.get("operator") or body.get("reviewer") or "andy").strip() or "andy"
+
+    # Dedicated row-action write gate (independent of the Confirm promotion
+    # scope). Fail-closed: BOTH flags must be set, so the route ships inert.
+    if not (review_write_enabled() and row_actions_write_enabled()):
+        return _json(
+            {
+                "error": "row_actions_write_disabled",
+                "message": (
+                    "8504 row-action writes are gated CLOSED. After operator "
+                    "approval set MAZIDEX_ADMIN_REVIEW_WRITE_ENABLED=1 AND "
+                    "MAZIDEX_ADMIN_ROW_ACTIONS_WRITE_ENABLED=1, and apply "
+                    "migration 019. Validated request echoed for dry-run."
+                ),
+                "validated_request": {
+                    "action": "delete",
+                    "source_key": source_key,
+                    "reason": reason,
+                },
+                "would_write_to": "review_decision_events",
+            },
+            status_code=503,
+        )
+
+    try:
+        with neon_conn() as c:
+            cur = c.cursor()
+            cur.execute(ROW_BY_SOURCE_KEY_SQL, (source_key,) * 5)
+            cols = [d.name for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            if not rows:
+                return _json(
+                    {"error": "source_key_not_found", "source_key": source_key},
+                    status_code=404,
+                )
+            target = pick_deletable_row(rows)
+            if target is None:
+                found_views = sorted({
+                    str(r.get("source_view") or r.get("observed_in") or "").lower()
+                    for r in rows
+                } - {""})
+                return _json(
+                    {
+                        "error": "row_not_deletable",
+                        "message": (
+                            "DELETE is scoped to identified + pending rows only. "
+                            "Trusted/feed/mazified rows are out of scope for this action."
+                        ),
+                        "source_key": source_key,
+                        "found_source_views": found_views,
+                    },
+                    status_code=409,
+                )
+            payload = soft_delete_payload(target, reason=reason, operator=operator)
+            result = write_decision(c, payload, write_enabled=True)
+            record = build_delete_record(
+                target,
+                reason=reason,
+                operator=operator,
+                event_id=result.get("event_id"),
+            )
+            # JSONL audit line keeps the FULL local paths (written before the
+            # response is privacy-scrubbed). Only filesystem write in Phase 3a.
+            ledger_path = append_delete_record(record)
+        return _json(
+            deep_scrub({
+                "status": "deleted_from_8504",
+                "source_key": source_key,
+                "event_id": result.get("event_id"),
+                "created_at": result.get("created_at"),
+                "retained_image": record.get("retained_image"),
+                "ledger_path": ledger_path,
+                "reversible_via": "clear",
+                "no_bytes_deleted": True,
+                "record": record,
+            }),
+            status_code=201,
+        )
+    except PermissionError:
+        return _json({"error": "review_write_disabled"}, status_code=503)
+    except ValueError as e:
+        msg = str(e)
+        if msg.startswith(("unmapped_semantic_decision",
+                           "recognized_but_not_db_supported",
+                           "unknown_decision",
+                           "missing_decision",
+                           "invalid_decision",
+                           "missing_comp_id",
+                           "missing_source_key")):
+            code = 422 if msg.split(":", 1)[0] in {
+                "unmapped_semantic_decision",
+                "recognized_but_not_db_supported",
+                "unknown_decision",
+                "missing_decision",
+            } else 400
+            key = "unsupported_decision" if code == 422 else "invalid_payload"
+            return _json({"error": key, "reason": msg}, status_code=code)
+        return _json({"error": msg}, status_code=400)
+    except Exception as e:
+        type_name = type(e).__name__
+        if "CheckViolation" in type_name or "IntegrityError" in type_name:
+            return _json(
+                {
+                    "error": "db_check_violation",
+                    "reason": f"{type_name}: {str(e)[:300]}",
+                    "hint": "Apply migration 019 to allow deleted_from_8504 before posting.",
+                },
+                status_code=422,
+            )
+        return _json({"error": "internal_error", "type": type_name}, status_code=500)
+
+
+# ============================================================================
+# SWAP FRONT row action (Phase 4) — next-best front rebind (identified+pending)
+# ============================================================================
+# The engine (whatnot-sniper-m4/ops/swap_front_for_source_key.py) always emits a
+# status string; the route maps it to an HTTP code. Unmapped → 500.
+def _swap_status_code(status: str) -> int:
+    if status == "swapped":
+        return 201  # real rebind written (frame re-stamped + folded into master)
+    if status in ("swap_prepared", "no_alternate_front_available"):
+        return 200  # dry-run preview, or explicit valid no-op (nothing mutated)
+    if status in ("no_lot_found", "refused_trusted_row"):
+        return 409  # on-disk detector lot missing / not a swappable surface
+    if status == "row_not_found":
+        return 404
+    if status == "unparseable_source_key":
+        return 400
+    if status == "integrity_refused_verified" or status.startswith("build_failed"):
+        return 422  # invariant guard tripped / record build failed
+    return 500
+
+
+def _swap_entry_from_row(row: dict) -> dict:
+    """Minimal engine `entry` from a resolved 8504 DB row (avoids the 1.1GB master).
+
+    r2b `build_record` reads `comp_id` (→ pid/auction + canonical filename), and
+    optionally `capture_quality` (carried forward) + `api_scan` (watermark
+    re-verify); the orchestrator reads `comp_id`/`front_image` + the view fields.
+    `raw_full` (the row's `raw` JSONB) already carries evidence_stamp/capture_quality/
+    api_scan; the authoritative DB columns are overlaid on top so a stale
+    `raw.observed_in`/`raw.front_image` can never mislead the view gate.
+    """
+    raw = row.get("raw_full")
+    entry: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    entry["comp_id"] = row.get("comp_id")
+    if row.get("source_view") is not None:
+        entry["source_view"] = row.get("source_view")
+    if row.get("observed_in") is not None:
+        entry["observed_in"] = row.get("observed_in")
+    if row.get("front_image"):
+        entry["front_image"] = row.get("front_image")
+    return entry
+
+
+def _parse_engine_json(stdout: str) -> "dict | None":
+    """Return the LAST top-level JSON object printed by the engine.
+
+    `--merge` runs merge_captures.py first (its output may precede the result
+    dict), so scan the whole stream and keep the final decodable object.
+    """
+    s = stdout or ""
+    dec = json.JSONDecoder()
+    last: "dict | None" = None
+    idx, n = 0, len(s)
+    while idx < n:
+        brace = s.find("{", idx)
+        if brace < 0:
+            break
+        try:
+            obj, end = dec.raw_decode(s, brace)
+            if isinstance(obj, dict):
+                last = obj
+            idx = end
+        except json.JSONDecodeError:
+            idx = brace + 1
+    return last
+
+
+@app.post("/api/v1/row-action/swap-front")
+async def row_action_swap_front(request: Request) -> JSONResponse:
+    """8504 SWAP FRONT row action — Phase 4 next-best front rebind.
+
+    Rebinds an identified/pending row to its NEXT-BEST front frame (highest
+    front-candidate score EXCLUDING the currently-bound frame) from the card's
+    on-disk detector-select lot, re-stamps it with the row's auction number, and
+    emits a comp_id `_update` rebind (folded into the master via merge_captures).
+    NEVER promotes, NEVER sets `verified`. No alternate frame → explicit no-op.
+    Scoped to identified + pending rows only (trusted/feed/mazified → 409).
+
+    The engine (ops/swap_front_for_source_key.py) drags `ijson` via the r2b
+    importer, so it runs OUT-OF-PROCESS under the whatnot-sniper-m4 venv; the route
+    hands it a DB-row-derived minimal entry via `--entry-json` (never the 1.1GB
+    master). A real (writing) swap requires an explicit per-call `confirm: true`
+    AND sets MAZI_IMAGE_BACKFILL_V1=1 for the subprocess — done ONLY when the write
+    gate is open. Any request without `confirm` (or with `dry_run: true`) runs as a
+    no-write preview.
+
+    Gated CLOSED by default behind BOTH MAZIDEX_ADMIN_REVIEW_WRITE_ENABLED and
+    MAZIDEX_ADMIN_ROW_ACTIONS_WRITE_ENABLED (fail-closed 503 echo).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"error": "malformed_json"}, status_code=400)
+
+    source_key = str(body.get("source_key") or "").strip()
+    if not source_key:
+        return _json({"error": "missing_source_key"}, status_code=400)
+
+    # Fail-safe: a real (writing) swap requires an explicit per-call confirm. An
+    # explicit dry_run, or a bare request with no confirm, runs as a preview.
+    do_write = bool(body.get("confirm")) and not bool(body.get("dry_run"))
+    effective_dry_run = not do_write
+
+    # Dedicated row-action write gate — fail-closed (BOTH flags required).
+    if not (review_write_enabled() and row_actions_write_enabled()):
+        return _json(
+            {
+                "error": "row_actions_write_disabled",
+                "message": (
+                    "8504 row-action writes are gated CLOSED. After operator "
+                    "approval set MAZIDEX_ADMIN_REVIEW_WRITE_ENABLED=1 AND "
+                    "MAZIDEX_ADMIN_ROW_ACTIONS_WRITE_ENABLED=1. A real swap also "
+                    "needs MAZI_IMAGE_BACKFILL_V1=1 and confirm:true. Echoed."
+                ),
+                "validated_request": {
+                    "action": "swap_front",
+                    "source_key": source_key,
+                    "would_write": do_write,
+                },
+                "would_write_to": "whatnot_cards image store + master (merge_captures)",
+            },
+            status_code=503,
+        )
+
+    # Resolve the row + confirm it's a swappable (identified/pending) surface.
+    try:
+        with neon_conn() as c:
+            cur = c.cursor()
+            cur.execute(ROW_BY_SOURCE_KEY_SQL, (source_key,) * 5)
+            cols = [d.name for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception as e:
+        return _json(
+            {"error": "internal_error", "type": type(e).__name__}, status_code=500
+        )
+
+    if not rows:
+        return _json(
+            {"error": "source_key_not_found", "source_key": source_key},
+            status_code=404,
+        )
+    # Shared identified/pending surface picker (same scoping as DELETE). None ⇒
+    # the key resolves only to trusted/feed/mazified → not swappable.
+    target = pick_deletable_row(rows)
+    if target is None:
+        found_views = sorted({
+            str(r.get("source_view") or r.get("observed_in") or "").lower()
+            for r in rows
+        } - {""})
+        return _json(
+            {
+                "error": "row_not_swappable",
+                "message": (
+                    "SWAP FRONT is scoped to identified + pending rows only. "
+                    "Trusted/feed/mazified rows are out of scope for this action."
+                ),
+                "source_key": source_key,
+                "found_source_views": found_views,
+            },
+            status_code=409,
+        )
+
+    entry = _swap_entry_from_row(target)
+
+    # Run the engine out-of-process under the whatnot-sniper-m4 venv (ijson wall).
+    import subprocess
+    import tempfile
+
+    engine = WHATNOT_DIR / "ops" / "swap_front_for_source_key.py"
+    py = WHATNOT_DIR / "venv" / "bin" / "python"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as fh:
+            json.dump(entry, fh, default=str)
+            tmp_path = fh.name
+        cmd = [
+            str(py), str(engine),
+            "--source-key", source_key,
+            "--entry-json", tmp_path,
+            "--json",
+        ]
+        env = dict(os.environ)
+        if effective_dry_run:
+            cmd.append("--dry-run")
+        else:
+            cmd.append("--merge")
+            # Tier-3 real-swap image write. Set ONLY here (gate verified open above).
+            env["MAZI_IMAGE_BACKFILL_V1"] = "1"
+        proc = subprocess.run(
+            cmd, cwd=str(WHATNOT_DIR), env=env,
+            capture_output=True, text=True, timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return _json(
+            {"error": "engine_timeout", "source_key": source_key}, status_code=504
+        )
+    except Exception as e:
+        return _json(
+            {"error": "engine_launch_failed", "type": type(e).__name__,
+             "detail": str(e)[:300]},
+            status_code=500,
+        )
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    result = _parse_engine_json(proc.stdout)
+    if not isinstance(result, dict):
+        return _json(
+            {
+                "error": "engine_bad_output",
+                "returncode": proc.returncode,
+                "stderr": (proc.stderr or "")[-600:],
+                "stdout": (proc.stdout or "")[-600:],
+            },
+            status_code=502,
+        )
+
+    status = str(result.get("status") or "")
+    return _json(
+        deep_scrub({
+            "action": "swap_front",
+            "source_key": source_key,
+            "dry_run": effective_dry_run,
+            "write_committed": do_write and status == "swapped",
+            **result,
+        }),
+        status_code=_swap_status_code(status),
+    )
 
 
 # ============================================================================

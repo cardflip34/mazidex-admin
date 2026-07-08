@@ -56,6 +56,21 @@ DB_VALID_DECISIONS = frozenset({
     "clear",
     "mazified",
     "deny",
+    # 8504 row-action decision (Phase 3a). DB-supported so the dedicated
+    # DELETE soft-hide route can write it through the single write_decision
+    # INSERT path. It can NEVER leak through the generic /api/v1/review-decision
+    # endpoint: that route's write stage accepts only decision=='confirm'
+    # (every other decision -> 403 write_scope_closed). Reversible via 'clear'.
+    "deleted_from_8504",
+})
+
+
+# DB-supported decisions that are written ONLY by a dedicated row-action route
+# (never the generic per-row decision menu). row_allowed_decisions() subtracts
+# these so the drawer's generic decision buttons never offer them -- DELETE is
+# its own button with its own keep-one-image / JSONL side effects.
+_ROW_ACTION_ONLY_DECISIONS = frozenset({
+    "deleted_from_8504",
 })
 
 
@@ -71,6 +86,10 @@ UNMAPPED_SEMANTIC_DECISIONS = frozenset({
     "human_confirmed_for_final_gate",
     "rejected_from_public_path",
     "hidden_from_work_queue",
+    # 8504 SWAP FRONT decision (Phase 4): written ONLY by its dedicated route,
+    # never the generic endpoint. (deleted_from_8504 graduated to
+    # DB_VALID_DECISIONS in Phase 3a now that the DELETE route exists.)
+    "front_swapped",
 })
 
 
@@ -129,6 +148,13 @@ _HARD_BLOCKER_CHIPS = {
 }
 
 _BANNED_SELLERS = {"kksportscards", "collectiblescloset", "tripp_cards"}
+
+# Generic capture placeholders the Whatnot ingest writes into identity columns
+# (card_name='Whatnot Live Capture' lives on 53.6k pending rows, plus title).
+# These are NOT real identity -- must be rejected in EVERY identity column.
+_GENERIC_IDENTITY_VALUES = frozenset({
+    "whatnot live capture", "whatnot", "live capture", "unidentified", "unknown",
+})
 
 _AUDIO_ADVISORY_TOKENS = (
     "audio-image-conflict",
@@ -227,11 +253,14 @@ def _row_text_blob(row: dict[str, Any]) -> str:
 
 
 def _row_has_gemini_or_image_identity(row: dict[str, Any]) -> bool:
-    for key in ("card_name", "player", "brand", "set_name"):
-        if str(row.get(key) or "").strip():
+    # A generic capture placeholder (e.g. card_name='Whatnot Live Capture') is
+    # NOT real identity. The ingest writes it into card_name AND title, so reject
+    # it in every identity column -- not just title.
+    for key in ("card_name", "player", "brand", "set_name", "title"):
+        v = str(row.get(key) or "").strip().lower()
+        if v and v not in _GENERIC_IDENTITY_VALUES:
             return True
-    title = str(row.get("title") or "").strip().lower()
-    return bool(title and title != "whatnot live capture")
+    return False
 
 
 def _row_has_audio_advisory_signal(row: dict[str, Any]) -> bool:
@@ -370,6 +399,50 @@ def _row_proof_different_sale(row: dict[str, Any]) -> bool:
     return False
 
 
+def _row_is_watermarked(row: dict[str, Any]) -> bool:
+    """Advisory drawer check: does the front carry an `_mazi` watermark?
+
+    Mirrors promotion._already_watermarked on an API-enriched row shape (which
+    additionally carries image_front_basename). The authoritative Pending->Trusted
+    guard is promotion._pending_trusted_gate_reasons on the raw DB row; this is
+    the drawer-rendering / 422-advisory twin.
+    """
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    evidence = raw.get("evidence_stamp") if isinstance(raw.get("evidence_stamp"), dict) else {}
+    capture = raw.get("capture_quality") if isinstance(raw.get("capture_quality"), dict) else {}
+    for value in (
+        row.get("image_front"),
+        row.get("image_front_neon_url"),
+        row.get("image_front_basename"),
+        raw.get("front_image_stamped"),
+        evidence.get("front_stamped_image"),
+    ):
+        if "_mazi." in str(value or "").lower():
+            return True
+    return str(capture.get("front_stamped", "")).strip().lower() == "true"
+
+
+def _row_single_card_ok(row: dict[str, Any]) -> bool:
+    """Advisory: one foremost card. Blocks on an explicit multi-card label or
+    api_scan.card_count >= 2; unknown count -> True (defer to human eyeballs).
+    Mirrors promotion._pending_single_card_ok."""
+    pending = row.get("pending_reasons") or []
+    if isinstance(pending, list):
+        for p in pending:
+            s = str(p).lower()
+            if "multi-card" in s or "multi_card" in s:
+                return False
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    api = raw.get("api_scan") if isinstance(raw.get("api_scan"), dict) else {}
+    cc = api.get("card_count")
+    if cc is None or str(cc).strip() == "":
+        return True
+    try:
+        return int(str(cc).strip()) <= 1
+    except (TypeError, ValueError):
+        return True
+
+
 _BLOCKER_LABELS = {
     "already_mazified": "ALREADY MAZIFIED",
     "proof_missing": "PROOF MISSING",
@@ -429,7 +502,9 @@ def row_allowed_decisions(row: dict[str, Any]) -> list[str]:
     """
     if not isinstance(row, dict):
         return []
-    allowed = set(DB_VALID_DECISIONS)
+    # Row-action-only decisions (e.g. deleted_from_8504) are written by their
+    # own dedicated routes, never offered in the generic per-row decision menu.
+    allowed = set(DB_VALID_DECISIONS) - _ROW_ACTION_ONLY_DECISIONS
     blockers = set(mazified_blockers(row))
     observed_in = str(row.get("observed_in") or row.get("source_view") or "").strip().lower()
     stage1_identified_confirm = (
@@ -440,6 +515,26 @@ def row_allowed_decisions(row: dict[str, Any]) -> list[str]:
         and "duplicate_or_collision" not in blockers
         and "banned_seller" not in blockers
         and "hard_blocker_present" not in blockers
+    )
+    # Pending->Trusted (Q1 trust model): watermark + single foremost card +
+    # Gemini/image identity + (downstream) human visual click. Stricter than the
+    # Identified path on identity_ambiguous because a pending row has no prior
+    # Identified confirmation behind it. Authoritative guard lives in
+    # promotion._pending_trusted_gate_reasons; this only drives drawer rendering.
+    pending_watermark_confirm = (
+        observed_in == "pending"
+        and not _row_image_missing_or_broken(row)
+        and _row_is_watermarked(row)
+        and _row_single_card_ok(row)
+        and _row_has_gemini_or_image_identity(row)
+        and not (blockers & {
+            "capture_hard_blocker",
+            "duplicate_or_collision",
+            "banned_seller",
+            "proof_different_sale",
+            "hard_blocker_present",
+            "identity_ambiguous",
+        })
     )
     if blockers:
         allowed.discard("mazified")
@@ -455,6 +550,8 @@ def row_allowed_decisions(row: dict[str, Any]) -> list[str]:
         # Hard-blocker rows admit only negative-path decisions.
         allowed &= {"reject", "deny", "flag", "clear"}
     if stage1_identified_confirm:
+        allowed.add("confirm")
+    if pending_watermark_confirm:
         allowed.add("confirm")
     cert = str(row.get("mazi_cert_status") or "").strip().lower()
     if cert not in {"verified", "human_approved"}:
