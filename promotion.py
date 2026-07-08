@@ -287,6 +287,12 @@ def _trusted_gate_block_reasons(row: dict[str, Any]) -> list[str]:
     if (expected is not None and str(expected).strip() != "" and row_auction != ""
             and str(expected).strip().lower() != row_auction):
         reasons.append("gate_binding_auction_mismatch")
+    # Banned sellers block EVERY ->Trusted path (2026-07-08): the list was only
+    # enforced on the pending gate, so the identified-path canary promoted 8
+    # tripp_cards rows straight past it.
+    seller = str(row.get("seller") or "").strip().lower()
+    if seller in _PENDING_BANNED_SELLERS:
+        reasons.append(f"gate_banned_seller_{seller}")
     return reasons
 
 

@@ -85,6 +85,10 @@ check("multiple defects -> all reasons reported",
                      "api_scan": {"card_count": "3",
                                   "mazi_watermark_verification": "mismatch"}}))) == 3)
 
+check("banned seller -> blocked",
+      any(r.startswith("gate_banned_seller") for r in g(row(seller="tripp_cards"))))
+check("normal seller -> eligible", g(row(seller="luckboxhits")) == [])
+
 # --- malformed raw never crashes --------------------------------------------
 check("raw=None -> eligible, no crash", g({"raw": None, "auction_number": "1"}) == [])
 check("raw not a dict -> eligible, no crash", g({"raw": "junk"}) == [])
