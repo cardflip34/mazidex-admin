@@ -24,3 +24,12 @@ mazi_db
 
 # --- large internal review image artifact (potential private content) ---
 static/backfill_reject_contact_sheet.jpg
+
+# --- repo-cleanup 2026-07-08 ---
+*.bak
+*.bak.*
+*.bak_*
+backups/
+__pycache__/
+*.pyc
+ops_live_pause.json
