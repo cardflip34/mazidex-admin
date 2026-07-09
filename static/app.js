@@ -395,11 +395,26 @@ function imageUrlForBasename(basename) {
   return basename ? `${PROXY_BASE}/${basename}` : '';
 }
 
+function isReviewFrame(row) {
+  // The tile is showing the full captured Whatnot stream frame, NOT a cropped
+  // card front. is_review_frame is set server-side from the original capture
+  // class (recovery_display_front / displayable_for_identified_review — rows
+  // that never got a timer-safe official front). image_front_is_ops_display is
+  // the older ops-display fallback signal; either means "not a clean card".
+  return !!(row && (row.is_review_frame || row.image_front_is_ops_display));
+}
+
 function reviewOnlyDisplayBadge(row) {
-  if (!row || !row.image_front_is_ops_display) return '';
+  if (!isReviewFrame(row)) return '';
   const source = row.ops_display_image_source || 'review context';
   const status = row.ops_display_image_status || 'review only';
-  return `<span class="chip visual-context-hold" title="${escapeAttr(source + ' · ' + status)}">REVIEW IMAGE</span>`;
+  // These rows never got a clean, cropped card front (no timer-safe official
+  // front — usually a wide multi-slab shot). The tile is showing the full
+  // captured stream frame, NOT a card crop. Say so plainly so a reviewer is
+  // never misled into reading it as a clean identified card image.
+  const tip = 'Full Whatnot stream frame — no clean cropped card front was captured '
+    + '(no timer-safe official front). Shown for review only · ' + source + ' · ' + status;
+  return `<span class="chip review-frame-warn" title="${escapeAttr(tip)}">⚠ STREAM FRAME · NO CARD CROP</span>`;
 }
 
 function pipelineStatus(row) {
@@ -429,6 +444,7 @@ function basenameRows(row) {
   const rows = [
     ['front basename', row.image_front_basename || ''],
     ['front 8504 proxy URL', row.image_front_basename ? imageUrlForBasename(row.image_front_basename) : ''],
+    ['front display crop', row.display_crop_basename || ''],
     ['back basename', row.image_back_basename || ''],
     ['back 8504 proxy URL', row.image_back_basename ? imageUrlForBasename(row.image_back_basename) : ''],
     ['proof basename', row.image_proof_basename || ''],
@@ -1301,8 +1317,8 @@ function renderBloombergDrawer(row, decList, actions, writeOpen) {
   const slotF = drawerImg(
     row.image_front_url,
     row.image_front_basename,
-    row.image_front_is_ops_display ? 'FRONT · REVIEW IMAGE' : 'FRONT',
-    row.image_front_is_ops_display
+    isReviewFrame(row) ? 'FRONT · REVIEW IMAGE' : 'FRONT',
+    isReviewFrame(row)
   );
   const slotB = drawerImg(row.image_back_url, row.image_back_basename, 'BACK');
   const slotP = drawerImg(row.image_proof_url, row.image_proof_basename, 'PROOF');
@@ -1704,7 +1720,7 @@ function tileHtml(row, index = 0) {
          data-image-front-basename="${escapeAttr(row.image_front_basename || "")}"
          data-image-proof-basename="${escapeAttr(row.image_proof_basename || "")}">
       ${hardBlockStrip}
-      <div class="tile-img-wrap">${imgEl}${reviewImageBadge ? `<div class="tile-review-image-badge">${reviewImageBadge}</div>` : ''}</div>
+      <div class="tile-img-wrap${isReviewFrame(row) ? ' is-review-frame' : ''}">${imgEl}${reviewImageBadge ? `<div class="tile-review-image-badge">${reviewImageBadge}</div>` : ''}</div>
       <div class="tile-body">
         <div class="tile-title">${escapeHtml(title)}</div>
         ${sub ? `<div class="tile-sub">${escapeHtml(sub)}</div>` : ''}
@@ -2215,12 +2231,12 @@ function drawerImg(url, basename, label, reviewOnlyDisplay) {
     return `<div class="slot"><div>no ${escapeHtml(label.toLowerCase())}</div></div>`;
   }
   const fallback = basename ? `${PROXY_BASE}/${basename}` : '';
-  return `<div class="slot">
+  return `<div class="slot${reviewOnlyDisplay ? ' is-review-frame' : ''}">
             <img src="${escapeAttr(url || fallback)}"
                  data-fallback="${escapeAttr(fallback)}"
                  onerror="imgFallback(this)" onload="imgOk(this)"
                  alt="${escapeHtml(label)}">
-            ${reviewOnlyDisplay ? `<div class="tile-review-image-badge"><span class="chip visual-context-hold">REVIEW IMAGE ONLY</span></div>` : ''}
+            ${reviewOnlyDisplay ? `<div class="tile-review-image-badge"><span class="chip review-frame-warn" title="Full Whatnot stream frame — no clean cropped card front captured; review only">⚠ STREAM FRAME · NO CARD CROP</span></div>` : ''}
           </div>`;
 }
 

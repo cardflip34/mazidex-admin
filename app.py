@@ -959,6 +959,21 @@ def _resolve_display_images(row: dict[str, Any]) -> None:
     proof_ basenames are never a valid front: they force the recovery fallback, and
     if nothing recoverable exists the tile is suppressed rather than showing CDN.
     """
+    # Preserve the ORIGINAL capture class before the identified-review overwrite
+    # at the bottom of this function clobbers front_image_status to
+    # "displayable_for_review". These two Neon statuses are the rows that never
+    # got a clean cropped card front — the tile is showing the full captured
+    # Whatnot stream frame, not a card. Verified empirically against the master
+    # capture data (source_buffer / front_quality_flag): recovery_display_front
+    # and displayable_for_identified_review are ~100% no_timer_safe_official_front
+    # rescue/video frames; valid_card_front and mini_intake_classical_front are
+    # the clean crops. The frontend badges is_review_frame so a reviewer is never
+    # misled into reading a stream frame as a clean identified card image.
+    _orig_front_status = str(row.get("front_image_status") or "").strip().lower()
+    row["is_review_frame"] = _orig_front_status in (
+        "recovery_display_front",
+        "displayable_for_identified_review",
+    )
     official_front_basename = extract_basename(
         row.get("image_front_neon_url"),
         row.get("image_front"),
@@ -1007,6 +1022,19 @@ def _resolve_display_images(row: dict[str, Any]) -> None:
     # image_front(_neon_url) here would re-surface a CDN/proof value that the block
     # above deliberately blanked, defeating the suppression.
     row["image_front_url"] = best_image_url(row.get("image_front_basename"))
+    # DISPLAY-ONLY preference (2026-07-09): overlay-bearing fronts (capture
+    # fallback-ladder rungs: recovery/mini-intake/container clips) may carry a
+    # non-destructive subject-card crop recorded beside raw as `display_crop`
+    # by display_crop_worker.py. Prefer it for the DISPLAY url only — the
+    # resolved basename (evidence identity, proof panels, watermark checks)
+    # stays untouched.
+    _raw_obj = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    _crop = _raw_obj.get("display_crop") if isinstance(_raw_obj, dict) else None
+    row["display_crop_basename"] = extract_basename(_crop) if _crop else ""
+    row["image_front_is_display_crop"] = False
+    if row["display_crop_basename"] and row.get("image_front_basename"):
+        row["image_front_url"] = best_image_url(row["display_crop_basename"])
+        row["image_front_is_display_crop"] = True
     row["image_back_url"] = best_image_url(
         row.get("image_back_neon_url"),
         row.get("image_back"),
