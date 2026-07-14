@@ -1930,6 +1930,29 @@ def row_detail(
         clicked_for_compare = {k: v for k, v in requested_identity.items() if v not in (None, "")}
         drift = source_drift_meta(clicked_for_compare, resolved_identity)
 
+        # Enriched-year surfacing (2026-07-13): GTR year overrides live beside-raw
+        # (gtr_year_overrides), so a row whose captured year is blank can still be
+        # gate-admitted and comp-matched on a certified enriched year — but this
+        # drawer used to show no year at all, which misreads as "year missing"
+        # (live case: Edwards Optic auto, certified 2020 via SCP+eBay). Fill the
+        # display year from the certified override and mark its provenance.
+        if not str(chosen.get("year") or "").strip():
+            _sk = str(chosen.get("source_key") or "").strip()
+            if _sk:
+                try:
+                    with neon_conn() as _yc:
+                        _ycur = _yc.cursor()
+                        _ycur.execute(
+                            "SELECT year, provenance FROM gtr_year_overrides"
+                            " WHERE source_key = %s AND state = 'certified'", (_sk,))
+                        _hit = _ycur.fetchone()
+                    if _hit and str(_hit[0] or "").strip():
+                        chosen["year"] = str(_hit[0]).strip()
+                        chosen["year_source"] = "gtr_certified_override"
+                        chosen["year_provenance"] = _hit[1]
+                except Exception:  # noqa: BLE001 — display enrichment must never 500 the drawer
+                    pass
+
         # Attach row-state-aware action affordances.
         chosen["allowed_decisions"] = row_allowed_decisions(chosen)
         chosen["mazified_button"]   = mazified_button_state(chosen)
