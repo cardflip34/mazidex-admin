@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import subprocess
 import sys
 import urllib.error
@@ -293,6 +294,107 @@ def _trusted_gate_block_reasons(row: dict[str, Any]) -> list[str]:
     seller = str(row.get("seller") or "").strip().lower()
     if seller in _PENDING_BANNED_SELLERS:
         reasons.append(f"gate_banned_seller_{seller}")
+    return reasons
+
+
+# Duplicate-sale guard (operator-approved 2026-07-13). Mirror of
+# whatnot-sniper-m4/mazi_db/scripts/trusted_gate.py TrustedDupIndex — keep in
+# sync. The 2026-06-05 legacypulls_ show was captured by two bots at once
+# (duplicate_seller_guard is per-host), double-promoting 19 sales; one
+# wolff_cards capture also entered twice under two source_key formats. Both
+# classes must block at THIS layer so no ->Trusted path can double-count a sale.
+_DUP_MC_CORE_RE = re.compile(r"(MC-\d{8,}-p\d+-\d+-a[\w-]+)")
+_DUP_MC_DATE_RE = re.compile(r"MC-(\d{8})")
+_DUP_MINI_DATE_RE = re.compile(r"mini_.+_(\d{4})-(\d{2})-(\d{2})")
+# Two captures of ONE sale land within seconds; a re-used auction number is a
+# different show, hours-to-days away. 30 minutes splits those cleanly.
+_DUP_SALE_WINDOW_SECONDS = 1800
+
+
+def _dup_capture_date(key: Any) -> str | None:
+    # bot-launch day for MC- keys, capture day for mini_<seller>_<a>_<pid>_<date>
+    s = str(key or "")
+    m = _DUP_MC_DATE_RE.search(s)
+    if m:
+        return m.group(1)
+    m = _DUP_MINI_DATE_RE.search(s)
+    return "".join(m.groups()) if m else None
+
+
+def _dup_sale_epoch(v: Any) -> float | None:
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).strip().replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _dup_seller_key(v: Any) -> str:
+    # Whatnot DOM text can glue the Follow button PLUS trailing overlay text to
+    # the handle (seen live: 'legacypulls_Follow', 'popsplosionFollow68Card')
+    s = str(v or "").strip().split("Follow")[0].lower()
+    return s[:-6] if s.endswith("follow") else s
+
+
+def _dup_price_key(v: Any) -> str | None:
+    if v in (None, ""):
+        return None
+    try:
+        return f"{float(v):.2f}"
+    except (TypeError, ValueError):
+        return str(v).strip()
+
+
+def _dup_same_sale_time(epoch_a: float | None, epoch_b: float | None,
+                        date_a: str | None, date_b: str | None) -> bool:
+    """Sale timestamps, when both exist, decide same-sale (within the window —
+    covers twin bots launched either side of midnight; beyond it a re-used
+    auction number passes). Else key-date equality, undated failing closed."""
+    if epoch_a is not None and epoch_b is not None:
+        return abs(epoch_a - epoch_b) <= _DUP_SALE_WINDOW_SECONDS
+    return date_a is None or date_b is None or date_a == date_b
+
+
+def _cell(record: Any, i: int) -> Any:
+    return record[i] if isinstance(record, (tuple, list)) else list(record.values())[i]
+
+
+def _duplicate_sale_reasons(cur: Any, row: dict[str, Any]) -> list[str]:
+    """gate_duplicate_* reasons when this row's sale is already in Trusted."""
+    reasons: list[str] = []
+    sk = str(row.get("source_key") or "").strip()
+    core = _DUP_MC_CORE_RE.search(sk)
+    if core:  # same capture id under a different source_key format
+        cur.execute(
+            "SELECT source_key FROM stage1_trusted_sales_current"
+            " WHERE source_key LIKE %s AND source_key <> %s LIMIT 1",
+            (f"%{core.group(1)}%", sk))
+        hit = cur.fetchone()
+        if hit:
+            return [f"gate_duplicate_capture_of:{_cell(hit, 0)}"]
+    seller_k = _dup_seller_key(row.get("seller"))
+    auction_k = str(row.get("auction_number") or "").strip().lower()
+    if seller_k and auction_k:
+        cur.execute(
+            "SELECT source_key, sold_price, raw->>'timestamp'"
+            " FROM stage1_trusted_sales_current"
+            " WHERE lower(regexp_replace(regexp_replace(btrim(coalesce(seller,'')),"
+            "             'Follow.*$', ''), 'follow$', '', 'i')) = %s"
+            "   AND lower(btrim(coalesce(auction_number::text,''))) = %s"
+            "   AND source_key <> %s",
+            (seller_k, auction_k, sk))
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+        date = _dup_capture_date(sk)
+        epoch = _dup_sale_epoch(raw.get("timestamp"))
+        price_k = _dup_price_key(row.get("sold_price"))
+        for rec in cur.fetchall():
+            esk = str(_cell(rec, 0))
+            if (_dup_price_key(_cell(rec, 1)) == price_k
+                    and _dup_same_sale_time(epoch, _dup_sale_epoch(_cell(rec, 2)),
+                                            date, _dup_capture_date(esk))):
+                reasons.append(f"gate_duplicate_sale_of:{esk}")
+                break
     return reasons
 
 
@@ -582,6 +684,7 @@ def promote_to_trusted(
     # MAZIDEX_TRUSTED_GATE_ENFORCE=0/false/off reverts to log-only, in which case
     # the block reasons are still recorded on the binding payload below.
     trusted_gate_blocks = _trusted_gate_block_reasons(row)
+    trusted_gate_blocks += _duplicate_sale_reasons(cur, row)
     trusted_gate_enforced = (
         str(os.environ.get("MAZIDEX_TRUSTED_GATE_ENFORCE", "1")).strip().lower()
         not in ("0", "false", "off")
