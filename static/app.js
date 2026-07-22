@@ -22,6 +22,7 @@ const STATE = {
   visible: [],                  // post-category-filter
   counts: {},                   // queue counts
   sourceCounts: {},             // per-source counts
+  oboBasis: 'include',          // external counts: 'include' (all) | 'exclude' (verified)
   health: null,
   writeEnabled: false,
   imgLoadOk: 0,
@@ -60,6 +61,10 @@ const SOURCE_TO_QUEUE = {
   fanatics:         null,
   heritage:         null,
   pwcc:             null,
+  rea:              null,   // served by /api/v1/source (external)
+  tcgplayer:        null,   // served by /api/v1/source (external)
+  myslabs:          null,   // served by /api/v1/source (external)
+  auctionreport:    null,   // served by /api/v1/source (external)
   vdex_discovery:   null,
 };
 
@@ -67,7 +72,8 @@ const SOURCE_TO_QUEUE = {
 // NOT from any Whatnot view. Tile renderer is slim (no proof/trust chips).
 // External tiles are NOT clickable — there is no Whatnot row to open in
 // the drawer.
-const EXTERNAL_SOURCES = new Set(['ebay', 'goldin', 'fanatics', 'heritage', 'pwcc']);
+const EXTERNAL_SOURCES = new Set(['ebay', 'goldin', 'fanatics', 'heritage', 'pwcc',
+  'rea', 'tcgplayer', 'myslabs', 'auctionreport']);
 
 const PROXY_BASE = "/proxy/image/whatnot_cards";
 const PLACEHOLDER_SVG =
@@ -504,6 +510,9 @@ function buildMarketComps(row) {
     // The target card's own grade, echoed on every comp (for default selection).
     target_grade_company: dot.target_grade_company || '',
     target_grade_value: dot.target_grade_value || '',
+    // Statistical price fence (app.py _flag_price_outliers): ''|'high'|'low'.
+    // Outliers stay on the chart as context dots but never average.
+    price_outlier: dot.price_outlier || '',
   }));
 
   if (row.sold_price) {
@@ -641,7 +650,7 @@ function gradeDropdownHtml(row, marketComps, selectedGroup) {
 // honest same-grade comp average; OBO stays context-only per the MAZI gate.
 function gradeGroupSoldComps(subset) {
   return (subset || []).filter(
-    (d) => !d.is_internal_whatnot && !d.is_obo && Number(d.sale_price) > 0
+    (d) => !d.is_internal_whatnot && !d.is_obo && !d.price_outlier && Number(d.sale_price) > 0
   );
 }
 
@@ -659,12 +668,16 @@ function gradeGroupAggregates(row, subset) {
     .filter((v) => Number.isFinite(v) && v > 0);
   const compCount = prices.length;
   const oboCount = (subset || []).filter((d) => !d.is_internal_whatnot && d.is_obo).length;
+  const outlierCount = (subset || []).filter(
+    (d) => !d.is_internal_whatnot && !d.is_obo && d.price_outlier
+  ).length;
   return {
     thisSale,
     compHigh: compCount ? Math.max.apply(null, prices) : null,
     compAvg: compCount ? prices.reduce((a, b) => a + b, 0) / compCount : null,
     compCount,
     oboCount,
+    outlierCount,
     hasComps: compCount > 0,
   };
 }
@@ -677,11 +690,16 @@ function gradePriceHeaderHtml(row, subset, groupLabel) {
       <span class="price-head-val">${val == null ? '-' : escapeHtml(fmtPrice(val))}</span>
     </div>`;
   const safeGroup = escapeHtml(groupLabel || RAW_GRADE_GROUP);
+  const outlierNote = agg.outlierCount
+    ? ` &middot; ${agg.outlierCount} price outlier${agg.outlierCount === 1 ? '' : 's'} quarantined from average`
+    : '';
   const note = agg.hasComps
     ? `${safeGroup}: ${agg.compCount} sold comp${agg.compCount === 1 ? '' : 's'} averaged`
       + (agg.oboCount ? ` &middot; ${agg.oboCount} OBO shown as context, excluded from average` : '')
+      + outlierNote
     : `${safeGroup}: no sold comps yet`
-      + (agg.oboCount ? ` &middot; ${agg.oboCount} OBO shown as context only` : '');
+      + (agg.oboCount ? ` &middot; ${agg.oboCount} OBO shown as context only` : '')
+      + outlierNote;
   return `
     <section class="bbg-card price-head-card">
       <div class="price-head-grid">
@@ -858,6 +876,7 @@ function averageSafeExternalComps(marketComps) {
     .filter((d) =>
       !d.is_internal_whatnot &&
       !d.is_obo &&
+      !d.price_outlier &&
       Number(d.sale_price) > 0
     )
     .slice()
@@ -939,6 +958,39 @@ function chartStatHtml(row, marketComps) {
     </div>`;
 }
 
+// ---- Zero-comp deliberate states --------------------------------------------
+// Backend (app.py _no_comp_state) attaches row.no_comp_state ONLY when the
+// exact-card comps list is empty: { bucket: 'rare_by_design' | 'pending_fill'
+// | 'coverage_gap', detail: {...} }. This renders a deliberate, explained
+// banner IN PLACE OF the bare "No exact external comps yet" empty-chart text.
+// Unknown/missing bucket falls back to coverage_gap copy (fail-honest: never
+// fabricate a rarity claim or a "comps are coming" promise).
+function noCompStateHtml(state) {
+  const s = (state && typeof state === 'object') ? state : {};
+  const detail = (s.detail && typeof s.detail === 'object') ? s.detail : {};
+  const bucket = String(s.bucket || '').trim();
+  let effectiveBucket = 'coverage_gap';
+  let head = 'NO COMPS FOUND';
+  let body = 'No exact-match sales found in any connected source yet.';
+  if (bucket === 'rare_by_design') {
+    effectiveBucket = 'rare_by_design';
+    if (String(detail.rarity_tier || '').trim() === 'unique') {
+      head = 'THIS SALE IS THE MARKET';
+      body = 'UNIQUE CARD (1/1) — no comparable sales can exist. This sale IS the market price.';
+    } else {
+      const run = Number(detail.print_run);
+      const n = Number.isFinite(run) && run > 0 ? String(run) : '?';
+      head = 'RARE BY DESIGN';
+      body = `Print run /${n} — comparable sales are expected to be sparse.`;
+    }
+  } else if (bucket === 'pending_fill') {
+    effectiveBucket = 'pending_fill';
+    head = 'COMPS BEING GATHERED';
+    body = 'Building the comp history — live sources are being scraped now.';
+  }
+  return `<div class="bbg-empty-state bbg-no-comp-state" data-no-comp-bucket="${escapeAttr(effectiveBucket)}"><b>${escapeHtml(head)}</b><span>${escapeHtml(body)}</span></div>`;
+}
+
 function marketChartHtml(row, marketComps) {
   const priced = marketComps
     .filter((d) => Number(d.sale_price) > 0)
@@ -979,8 +1031,11 @@ function marketChartHtml(row, marketComps) {
     const r = d.is_context_only ? 4.6 : 4.2;
     const fill = d.is_context_only ? 'transparent' : style.color;
     const opacity = d.data_era === 'era-1' ? 0.55 : 1;
-    const stroke = d.is_obo ? '#f97316' : style.color;
-    const label = `${style.label} ${fmtPrice(d.sale_price)} ${d.sale_date || ''}`;
+    // Price-fence outliers draw crimson so a quarantined spike is visibly
+    // different from an OBO (orange) or a clean sale; still on the chart.
+    const stroke = d.price_outlier ? '#dc2626' : (d.is_obo ? '#f97316' : style.color);
+    const outlierTag = d.price_outlier ? ` · PRICE OUTLIER (${d.price_outlier}) — excluded from average` : '';
+    const label = `${style.label} ${fmtPrice(d.sale_price)} ${d.sale_date || ''}${outlierTag}`;
     const img = d.thumbnail_url || d.image_url || '';
     const tipW = 172;
     const tipH = 130;
@@ -991,13 +1046,13 @@ function marketChartHtml(row, marketComps) {
       : `<div class="bbg-point-noimg"><b>${escapeHtml(style.label)}</b><span>source image pending</span></div>`;
     return `
       <g class="bbg-point" opacity="${opacity}">
-        <circle class="bbg-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" fill="${fill}" stroke="${stroke}" stroke-width="${d.is_context_only || d.is_obo ? 2.2 : 1.5}"><title>${escapeHtml(label)}</title></circle>
+        <circle class="bbg-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${r}" fill="${fill}" stroke="${stroke}" stroke-width="${d.is_context_only || d.is_obo || d.price_outlier ? 2.2 : 1.5}"${d.price_outlier ? ' stroke-dasharray="3 2"' : ''}><title>${escapeHtml(label)}</title></circle>
         <foreignObject class="bbg-point-tip" x="${tipX.toFixed(1)}" y="${tipY.toFixed(1)}" width="${tipW}" height="${tipH}">
           <div xmlns="http://www.w3.org/1999/xhtml" class="bbg-point-card">
             ${imgHtml}
             <div class="bbg-point-card-body">
               <b>${escapeHtml(fmtPrice(d.sale_price))}</b>
-              <span>${escapeHtml([style.label, d.sale_date, d.grade].filter(Boolean).join(' · '))}</span>
+              <span>${escapeHtml([style.label, d.sale_date, d.grade, d.price_outlier ? `PRICE OUTLIER (${d.price_outlier})` : ''].filter(Boolean).join(' · '))}</span>
               <small>${escapeHtml(d.title || '')}</small>
             </div>
           </div>
@@ -1014,8 +1069,14 @@ function marketChartHtml(row, marketComps) {
     return `<line x1="${leftPad}" y1="${y}" x2="${width - rightPad}" y2="${y}" /><text x="8" y="${y + 4}">${escapeHtml(fmtPrice(v))}</text>`;
   }).join('');
 
+  // Zero-comp deliberate state: when the backend attached row.no_comp_state
+  // (only possible when the WHOLE exact-card comps list came back empty), the
+  // explained banner replaces the generic empty-chart text. Rows with comps
+  // never carry no_comp_state, so the existing rendering is unchanged.
   const emptyText = externalExact.length === 0
-    ? '<div class="bbg-empty-state">No exact external comps yet. Fair value pending. Context comps are not averaged. News delayed.</div>'
+    ? (row.no_comp_state
+      ? noCompStateHtml(row.no_comp_state)
+      : '<div class="bbg-empty-state">No exact external comps yet. Fair value pending. Context comps are not averaged. News delayed.</div>')
     : '';
 
   return `
@@ -1906,7 +1967,7 @@ async function loadCounts() {
     console.warn('counts err', e);
   }
   try {
-    const s = await fetchJson('/api/v1/sources/counts');
+    const s = await fetchJson(`/api/v1/sources/counts?obo=${STATE.oboBasis}`);
     STATE.sourceCounts = s.counts || {};
     Object.keys(STATE.sourceCounts).forEach(name => {
       $$(`.tab-count[data-count-for="${name}"]`).forEach(el => {
@@ -1923,7 +1984,7 @@ async function loadCounts() {
 
 async function loadStats() {
   try {
-    const j = await fetchJson('/api/v1/stats/header');
+    const j = await fetchJson(`/api/v1/stats/header?obo=${STATE.oboBasis}`);
     // Pipeline funnel — pure row counts, one source per stage (reconciles with tab counts).
     $('#statPending').textContent    = fmtIntShort(j.pending_count ?? 0);
     $('#statIdentified').textContent = fmtIntShort(j.identified_count ?? 0);
@@ -1966,6 +2027,16 @@ function ensureWorkbenchControls() {
   sortEl.addEventListener('change', () => { STATE.sortMode = sortEl.value; loadCurrentView(); });
   wmEl.addEventListener('change', () => { STATE.watermarkedOnly = wmEl.checked; loadCurrentView(); });
   $('#controlledRefresh').addEventListener('click', controlledRefresh);
+  // External-comps OBO basis dropdown: all comps (default) vs verified/OBO-excluded.
+  const oboEl = $('#oboBasis');
+  if (oboEl) {
+    oboEl.value = STATE.oboBasis;
+    oboEl.addEventListener('change', () => {
+      STATE.oboBasis = oboEl.value;
+      loadStats();   // header "External Comps" total
+      loadCounts();  // per-source chips
+    });
+  }
 }
 
 async function controlledRefresh() {

@@ -865,7 +865,8 @@ def _external_source_where(source: str) -> str:
         AND best_offer = FALSE
         AND verified_price_eligible = TRUE
         """
-    if source in {"goldin", "fanatics", "heritage", "pwcc"}:
+    if source in {"goldin", "fanatics", "heritage", "pwcc",
+                  "rea", "tcgplayer", "myslabs", "auctionreport"}:
         return f"""
         source_code = '{source}'
         AND verified_price_eligible = TRUE
@@ -961,12 +962,22 @@ EXTERNAL_PWCC_SQL = f"""
 """
 
 
+# New sources reuse the same dynamic query builder (_external_source_sql via
+# _external_source_where); the map VALUE is unused for query construction —
+# presence here registers them as browsable external sources (external_sql gate
+# + EXTERNAL_SOURCE_NAMES). Add a source_code here to make its tab browsable.
+_EXTERNAL_DYNAMIC = "-- built dynamically via _external_source_where --"
+
 EXTERNAL_SQL_MAP: dict[str, str] = {
     "ebay": EXTERNAL_EBAY_SQL,
     "goldin": EXTERNAL_GOLDIN_SQL,
     "fanatics": EXTERNAL_FANATICS_SQL,
     "heritage": EXTERNAL_HERITAGE_SQL,
     "pwcc": EXTERNAL_PWCC_SQL,
+    "rea": _EXTERNAL_DYNAMIC,
+    "tcgplayer": _EXTERNAL_DYNAMIC,
+    "myslabs": _EXTERNAL_DYNAMIC,
+    "auctionreport": _EXTERNAL_DYNAMIC,
 }
 
 
@@ -976,15 +987,41 @@ def external_sql(source: str, limit: int | None = None, search: str | None = Non
     return _external_source_sql(source, limit=limit, search=search, page=page)
 
 
-# Per-source counts (UNION ALL) — matches the safe-filter predicates above
+# Per-source INVENTORY counts — DYNAMIC (every source_code, current + future
+# auto-appear) and TRUE totals (all rows). Drives the chips and reconciles with
+# the reference-inventory header card. The verified/OBO valuation gate is applied
+# only in the per-source BROWSE queries (EXTERNAL_*_SQL / external_sql), never
+# here — this is "reference only, not a stage" inventory.
 EXTERNAL_COUNTS_SQL = """
     SELECT source_code, COUNT(*) AS n
     FROM external_transactions
-    WHERE source_code IN ('ebay', 'goldin', 'fanatics', 'heritage', 'pwcc')
-      AND verified_price_eligible = TRUE
+    GROUP BY source_code
+    ORDER BY n DESC
+"""
+
+# OBO-excluded (verified) variant — same shape, applies the valuation gate so the
+# dashboard can toggle between all-comps (default) and verified-only via a dropdown.
+EXTERNAL_COUNTS_SQL_VERIFIED = """
+    SELECT source_code, COUNT(*) AS n
+    FROM external_transactions
+    WHERE verified_price_eligible = TRUE
       AND (source_code <> 'ebay' OR best_offer = FALSE)
     GROUP BY source_code
+    ORDER BY n DESC
 """
+
+
+def external_counts_sql(obo_exclude: bool = False) -> str:
+    """Per-source counts SQL: all comps (default) or OBO-excluded/verified."""
+    return EXTERNAL_COUNTS_SQL_VERIFIED if obo_exclude else EXTERNAL_COUNTS_SQL
+
+
+# WHERE fragment for the header 'external' CTE, matching the counts basis above.
+def external_total_where(obo_exclude: bool = False) -> str:
+    if obo_exclude:
+        return ("WHERE verified_price_eligible = TRUE\n"
+                "              AND (source_code <> 'ebay' OR best_offer = FALSE)")
+    return ""
 
 
 # ============================================================================

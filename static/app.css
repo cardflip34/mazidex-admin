@@ -446,6 +446,30 @@ body.density-tiny .grid {
   font-size: 22px; opacity: 0.5; line-height: 1; margin-bottom: 4px;
 }
 
+/* Review-frame treatment: the tile is showing the full captured stream frame,
+   NOT a cropped card front (no timer-safe official front was captured — usually
+   a wide multi-slab shot). Make that unmistakable at a glance so a reviewer
+   never mistakes the Whatnot layer for a clean identified card image. */
+.tile-img-wrap.is-review-frame,
+.bbg-capture .slot.is-review-frame,
+.drawer-content .images .slot.is-review-frame {
+  outline: 2px dashed #d97706;
+  outline-offset: -2px;
+  background: repeating-linear-gradient(45deg, #fffbeb, #fffbeb 10px, #fef3c7 10px, #fef3c7 20px);
+}
+.tile-img-wrap.is-review-frame .tile-img,
+.slot.is-review-frame img { opacity: 0.82; }
+.tile-review-image-badge {
+  position: absolute; top: 6px; left: 6px; right: 6px;
+  display: flex; justify-content: center; pointer-events: none; z-index: 3;
+}
+.chip.review-frame-warn {
+  background: #b45309; border: 1px solid #92400e; color: #fff;
+  font-weight: 700; font-size: 9.5px; letter-spacing: 0.02em;
+  padding: 2px 7px; border-radius: 999px; white-space: nowrap;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35); pointer-events: auto;
+}
+
 .tile-body { padding: 6px 8px 8px; }
 .tile-title {
   font-weight: 700; font-size: 12px;
@@ -956,6 +980,20 @@ body.density-tiny .safety-badges { display: none; }
 }
 .bbg-empty-state.small {
   margin-top: 0;
+}
+/* Zero-comp deliberate-state banner (rare_by_design / pending_fill /
+   coverage_gap). Same footprint as .bbg-empty-state so no layout shift. */
+.bbg-no-comp-state b {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.bbg-no-comp-state[data-no-comp-bucket="rare_by_design"] {
+  border-style: solid;
 }
 .bbg-advisory-tag {
   display: inline-block;
@@ -1603,4 +1641,17 @@ body.density-tiny .safety-badges { display: none; }
   font-size: 12px;
   font-weight: 600;
   align-self: center;
+}
+
+/* External-comps OBO basis dropdown (hero stat) */
+.hero-obo-select {
+  margin-top: 6px;
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(0,0,0,0.15);
+  background: rgba(255,255,255,0.9);
+  color: #334;
+  cursor: pointer;
+  max-width: 100%;
 }

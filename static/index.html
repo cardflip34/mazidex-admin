@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/app.css?v=20260703-audio-callout-v2">
+<link rel="stylesheet" href="/static/app.css?v=20260708-review-frame-v2">
 </head>
 <body class="density-standard">
 <div class="shell">
@@ -88,6 +88,10 @@
         <div class="hero-stat-val" id="statExternal">—</div>
         <div class="hero-stat-label">External Comps</div>
         <div class="hero-stat-sub">Reference only · not a stage</div>
+        <select id="oboBasis" class="hero-obo-select" title="Include Best-Offer (OBO) comps in the totals (default), or exclude them for a verified-price basis.">
+          <option value="include">OBO included · all comps</option>
+          <option value="exclude">OBO excluded · verified</option>
+        </select>
       </div>
     </div>
   </section>
@@ -133,6 +137,22 @@
     <button class="tab" role="tab" aria-selected="false" data-source="pwcc">
       <span class="tab-label">PWCC</span>
       <span class="tab-count" data-count-for="pwcc">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="rea">
+      <span class="tab-label">REA</span>
+      <span class="tab-count" data-count-for="rea">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="tcgplayer">
+      <span class="tab-label">TCGplayer</span>
+      <span class="tab-count" data-count-for="tcgplayer">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="myslabs">
+      <span class="tab-label">MySlabs</span>
+      <span class="tab-count" data-count-for="myslabs">—</span>
+    </button>
+    <button class="tab" role="tab" aria-selected="false" data-source="auctionreport">
+      <span class="tab-label">Auction Report</span>
+      <span class="tab-count" data-count-for="auctionreport">—</span>
     </button>
     <button class="tab" role="tab" aria-selected="false" data-source="vdex_discovery" hidden>
       <span class="tab-label">VDEX Discovery</span>
@@ -194,6 +214,6 @@
 
 </div>
 
-<script src="/static/app.js?v=20260703-audio-callout-v2" defer></script>
+<script src="/static/app.js?v=20260708-review-frame-v2" defer></script>
 </body>
 </html>

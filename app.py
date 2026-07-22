@@ -87,6 +87,8 @@ from row_actions import (
 from queues import (
     DECISIONS_SQL,
     EXTERNAL_COUNTS_SQL,
+    external_counts_sql,
+    external_total_where,
     EXTERNAL_SQL_MAP,
     QUEUE_COUNTS_SQL,
     QUEUE_MAP,
@@ -185,10 +187,14 @@ GRADE_VALUE_RE = re.compile(r"\b(10|9\.5|9|8\.5|8|7\.5|7|6\.5|6|5\.5|5|4|3|2|1)\
 # corpus rows, and exact_card_match_audit_v1.grade_company/grade_value carry the
 # WHATNOT TARGET (card) grade, identical on every comp. The only reliable source
 # of a comp's own grade is its listing title, parsed here.
+# Letter-boundaries instead of \b: eBay titles glue the grade to the company
+# ("PSA9", "BGS9.5"), and \bPSA\b fails there (A->9 is not a word boundary),
+# silently bucketing a graded sale into Raw/Ungraded — found live 2026-07-14
+# ($7,950 "International Gold /10 PSA9" averaged into a raw chart).
 _COMP_GRADE_COMPANY_RE = re.compile(
-    r"\b(" + "|".join(
+    r"(?<![A-Za-z])(" + "|".join(
         sorted(set(GRADE_COMPANIES) | set(GRADE_COMPANY_ALIASES), key=len, reverse=True)
-    ) + r")\b",
+    ) + r")(?![A-Za-z])",
     re.I,
 )
 
@@ -211,6 +217,73 @@ def _parse_comp_grade(title: str) -> tuple[str, str, str]:
     value = vm.group(1) if vm else ""
     group = (company + " " + value).strip()
     return (company, value, group)
+
+
+# Statistical price fence (operator-approved 2026-07-14). Within one grade
+# group, a sold comp far from the group median is almost never the same card:
+# backtested on the full trusted lane, 23.5% of grade tabs had their COMP AVG
+# distorted >=3x by a single serial-numbered parallel, mis-bucketed graded
+# card, or thin-title high-end sale. Flagged comps stay VISIBLE as context
+# dots; only the average excludes them (frontend gradeGroupSoldComps).
+PRICE_OUTLIER_RATIO = 3.0
+PRICE_OUTLIER_MIN_COMPS = 4
+
+
+def _median(values: list[float]) -> float:
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _flag_price_outliers(comps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark comps whose price is >=3x or <=1/3 their grade group's median.
+
+    The median is computed from the group's real sold comps (non-OBO,
+    price > 0, external only) and only when the group has enough of them
+    (>= PRICE_OUTLIER_MIN_COMPS) to make the fence meaningful. OBO comps can
+    carry the flag for display styling but their average treatment is
+    unchanged (never averaged). Mutates and returns `comps`.
+    """
+    grouped: dict[str, list[float]] = {}
+    for comp in comps:
+        if comp.get("is_obo") or comp.get("is_internal_whatnot"):
+            continue
+        try:
+            price = float(comp.get("sale_price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price > 0:
+            grouped.setdefault(comp.get("grade_group") or "Raw/Ungraded", []).append(price)
+    medians = {
+        group: _median(prices)
+        for group, prices in grouped.items()
+        if len(prices) >= PRICE_OUTLIER_MIN_COMPS
+    }
+    for comp in comps:
+        if comp.get("is_internal_whatnot"):
+            comp["price_outlier"] = ""
+            continue
+        med = medians.get(comp.get("grade_group") or "Raw/Ungraded")
+        try:
+            price = float(comp.get("sale_price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        outlier = ""
+        if med and price > 0:
+            if price >= med * PRICE_OUTLIER_RATIO:
+                outlier = "high"
+            elif price <= med / PRICE_OUTLIER_RATIO:
+                outlier = "low"
+        comp["price_outlier"] = outlier
+        if outlier and not comp.get("is_obo"):
+            comp["included_in_average"] = False
+            comp["is_context_only"] = True
+            comp["average_policy"] = "price_outlier_context_only"
+            comp["display_context"] = "context_only"
+            if not comp.get("reason_excluded"):
+                comp["reason_excluded"] = f"price_outlier_{outlier}_vs_grade_group_median"
+    return comps
 
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -610,6 +683,10 @@ SOURCE_QUEUE_MAP: dict[str, str | None] = {
     "fanatics":           None,
     "heritage":           None,
     "pwcc":               None,
+    "rea":                None,   # external — served by external_sql()
+    "tcgplayer":          None,   # external — served by external_sql()
+    "myslabs":            None,   # external — served by external_sql()
+    "auctionreport":      None,   # external — served by external_sql()
     "vdex_discovery":     None,
 }
 
@@ -629,6 +706,10 @@ EXTERNAL_FILTER_SPEC: dict[str, dict[str, Any]] = {
     "fanatics": {"source_code": "fanatics",                    "verified_price_eligible": True},
     "heritage": {"source_code": "heritage",                    "verified_price_eligible": True},
     "pwcc":     {"source_code": "pwcc",                        "verified_price_eligible": True},
+    "rea":           {"source_code": "rea",           "verified_price_eligible": True},
+    "tcgplayer":     {"source_code": "tcgplayer",     "verified_price_eligible": True},
+    "myslabs":       {"source_code": "myslabs",       "verified_price_eligible": True},
+    "auctionreport": {"source_code": "auctionreport", "verified_price_eligible": True},
 }
 
 
@@ -1301,7 +1382,141 @@ def _market_comps_for_row(row: dict[str, Any], limit: int = 250) -> list[dict[st
             "match_type": "lookup_error",
             "trust_status": "unavailable",
         }]
-    return deep_scrub(comps)
+    return deep_scrub(_flag_price_outliers(comps))
+
+
+# ---- Zero-comp deliberate states (2026-07-16) -------------------------------
+# A Trusted card with ZERO exact-card comps must show a deliberate, explained
+# state instead of a bare empty chart. Three buckets:
+#   rare_by_design : 1/1 / low-serial print run -- comparable sales are
+#                    structurally sparse-to-impossible; THIS SALE is the market.
+#   pending_fill   : the deep-scrub enrichment job is still pending/running --
+#                    comps are being gathered right now.
+#   coverage_gap   : deep scrub completed/failed/never ran and nothing matched
+#                    -- an honest "no exact-match sales found yet".
+# Computed ONLY on the zero-comp path (at most ONE extra read-only query) and
+# attached to the drawer row as `no_comp_state`. Rows with comps are untouched.
+
+# Dates ("11/12/2024") must never read as print runs; strip them first.
+_NO_COMP_DATE_RE = re.compile(r"\b\d{1,4}\s*/\s*\d{1,2}\s*/\s*\d{1,4}\b")
+# Grade fractions ("PSA 10/10", "BGS 9.5/10") must never read as print runs.
+_NO_COMP_GRADE_FRACTION_RE = re.compile(
+    r"\b(?:PSA|BGS|SGC|CGC|CSG|BVG|BCCG|GMA|HGA|TAG|BECKETT)\s*-?\s*"
+    r"\d{1,2}(?:\.\d)?\s*/\s*\d{1,2}\b",
+    re.I,
+)
+# 1/1 in its written/spoken forms -> tier 'unique'.
+_NO_COMP_UNIQUE_RE = re.compile(
+    r"(?:\b1\s*/\s*1\b|\bone\s+of\s+one\b|\b1\s+of\s+1\b)", re.I)
+# Print-run denominator: "/5", "23/99". Runs only AFTER date + grade-fraction
+# stripping. The trailing guard rejects a residual date-ish "N/N/N" shape.
+_NO_COMP_PRINT_RUN_RE = re.compile(r"/\s*(\d{1,3})\b(?!\s*[/.]\s*\d)")
+
+# Deep-scrub job kinds + live statuses (trusted_enrichment_jobs, migration 016/017).
+_NO_COMP_SCRUB_KINDS = ("deep_scrub_initial", "deep_scrub_refresh")
+_NO_COMP_LIVE_STATUSES = {"pending", "running"}
+
+
+def _no_comp_rarity(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Pure regex rarity read over the row's identity text. None = not rare.
+
+    Scans title / card_name / variant (plus identity_json values when a caller
+    still has that payload attached; the drawer row has it popped). Returns
+    {rarity_tier, print_run, matched_token, matched_field} for 1/1 and
+    print-run <= 25 cards.
+    """
+    texts: list[tuple[str, str]] = [
+        ("title", str(row.get("title") or "")),
+        ("card_name", str(row.get("card_name") or "")),
+        ("variant", str(row.get("variant") or "")),
+    ]
+    identity = row.get("identity_json")
+    if isinstance(identity, dict):
+        texts.append(("identity_json", " ".join(
+            str(v) for v in identity.values() if isinstance(v, (str, int, float)))))
+    elif isinstance(identity, str):
+        texts.append(("identity_json", identity))
+
+    for field, raw_text in texts:
+        if not raw_text.strip():
+            continue
+        text = _NO_COMP_DATE_RE.sub(" ", raw_text)
+        unique = _NO_COMP_UNIQUE_RE.search(text)
+        if unique:
+            return {
+                "rarity_tier": "unique",
+                "print_run": 1,
+                "matched_token": unique.group(0).strip(),
+                "matched_field": field,
+            }
+        text = _NO_COMP_GRADE_FRACTION_RE.sub(" ", text)
+        runs = [
+            (int(m.group(1)), m.group(0).strip())
+            for m in _NO_COMP_PRINT_RUN_RE.finditer(text)
+        ]
+        runs = [(n, token) for n, token in runs if 0 < n <= 25]
+        if runs:
+            n, token = min(runs)
+            tier = "unique" if n == 1 else ("ultra_rare" if n <= 10 else "rare")
+            return {
+                "rarity_tier": tier,
+                "print_run": n,
+                "matched_token": token,
+                "matched_field": field,
+            }
+    return None
+
+
+def _latest_deep_scrub_status(conn: Any, source_key: str) -> str:
+    """Newest deep-scrub job status for a source_key ('' = no job on file)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT status FROM trusted_enrichment_jobs"
+        " WHERE source_key = %s"
+        "   AND job_kind IN ('deep_scrub_initial', 'deep_scrub_refresh')"
+        " ORDER BY created_at DESC LIMIT 1",
+        (source_key,),
+    )
+    hit = cur.fetchone()
+    return str(hit[0] or "").strip().lower() if hit else ""
+
+
+def _no_comp_state(
+    conn: Any,
+    source_key: str,
+    row: dict[str, Any],
+    comps: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Deliberate zero-comp explanation for the drawer. None when comps exist.
+
+    conn may be a live read-only connection (tests inject a fake) or None, in
+    which case a connection is opened only if the job-status query is actually
+    needed (the rare_by_design path needs no query at all). Read-only;
+    fail-open to coverage_gap so a lookup error can never 500 the drawer or
+    fabricate a "comps are coming" promise.
+    """
+    if comps:
+        return None
+    rarity = _no_comp_rarity(row)
+    if rarity:
+        return {"bucket": "rare_by_design", "detail": rarity}
+    sk = str(source_key or "").strip()
+    status = ""
+    if sk:
+        try:
+            if conn is not None:
+                status = _latest_deep_scrub_status(conn, sk)
+            else:
+                with neon_conn() as own:
+                    status = _latest_deep_scrub_status(own, sk)
+        except Exception as exc:  # noqa: BLE001 — display state must never 500 the drawer
+            return {
+                "bucket": "coverage_gap",
+                "detail": {"job_status": "lookup_error", "error": type(exc).__name__},
+            }
+    if status in _NO_COMP_LIVE_STATUSES:
+        return {"bucket": "pending_fill", "detail": {"job_status": status}}
+    return {"bucket": "coverage_gap", "detail": {"job_status": status or "absent"}}
 
 
 def _source_sibling_summary(row: dict[str, Any], selected: bool) -> dict[str, Any]:
@@ -1389,6 +1604,8 @@ def _shape_external_row(
     image_url = first_public_image(
         raw_jsonb.get("image_url"),
         raw_jsonb.get("imageUrl"),
+        raw_jsonb.get("imgUrl"),      # eBay bulk-scraper raw schema (camelCase)
+        raw_jsonb.get("img_url"),
         raw_jsonb.get("thumbnail_url"),
         raw_jsonb.get("thumbnailUrl"),
         raw_jsonb.get("gallery_url"),
@@ -1399,6 +1616,21 @@ def _shape_external_row(
     )
     if isinstance(image_url, str) and image_url.startswith("/Users/"):
         image_url = ""  # defensive — should never happen for ext sources
+
+    # Source-specific image construction: some sources' raw carries an id/name
+    # but not a full URL. Build the public CDN URL (reference thumbnail).
+    if not image_url:
+        if source_code == "tcgplayer" and raw_jsonb.get("product_id"):
+            image_url = (
+                "https://product-images.tcgplayer.com/fit-in/437x437/%s.jpg"
+                % raw_jsonb["product_id"]
+            )
+        elif (source_code == "goldin"
+              and raw_jsonb.get("lot_id") and raw_jsonb.get("primary_image_name")):
+            image_url = (
+                "https://d2tt46f3mh26nl.cloudfront.net/public/Lots/%s/%s@2x"
+                % (raw_jsonb["lot_id"], raw_jsonb["primary_image_name"])
+            )
 
     # Source URL (link out to the original listing/lot).
     listing_url = (
@@ -1646,20 +1878,22 @@ def sources_list() -> dict[str, Any]:
 
 
 @app.get("/api/v1/sources/counts")
-def sources_counts() -> dict[str, Any]:
+def sources_counts(
+    obo: str = Query("include", description="include (all comps, default) | exclude (verified/OBO-excluded)"),
+) -> dict[str, Any]:
     qc = queue_counts()
     counts = qc.get("counts") or {}
     out: dict[str, int] = {}
     for src, q in SOURCE_QUEUE_MAP.items():
         out[src] = int(counts.get(q, 0)) if q else 0
 
-    # External-comp tabs: read filtered counts from external_transactions.
-    # Wrapped in try/except so a DB hiccup doesn't break the whole counts
-    # response — placeholders survive at 0 in that case.
+    # External-comp tabs: read counts from external_transactions. Default = all
+    # comps (OBO included); obo=exclude applies the verified/OBO valuation gate.
+    # Wrapped in try/except so a DB hiccup doesn't break the whole counts response.
     try:
         with neon_conn() as c:
             cur = c.cursor()
-            cur.execute(EXTERNAL_COUNTS_SQL)
+            cur.execute(external_counts_sql(obo == "exclude"))
             for src, n in cur.fetchall():
                 if src in SOURCE_QUEUE_MAP:
                     out[src] = int(n or 0)
@@ -1755,7 +1989,9 @@ def source(
 # Header stats — pipeline funnel counts (Pending → Identified → Trusted → Mazified)
 # ============================================================================
 @app.get("/api/v1/stats/header")
-def stats_header() -> dict[str, Any]:
+def stats_header(
+    obo: str = Query("include", description="include (all comps, default) | exclude (verified/OBO-excluded)"),
+) -> dict[str, Any]:
     """Pipeline funnel header counts, computed live from Neon. Empty-safe.
 
     One authoritative source per stage, mirroring the per-tab queries in
@@ -1795,14 +2031,16 @@ def stats_header() -> dict[str, Any]:
             WHERE latest.decision = 'mazified'
         ),
         external AS (
+            -- Reference INVENTORY. Default = all external comps (OBO included);
+            -- obo=exclude applies the verified/OBO valuation gate to match the
+            -- per-source chip counts. "Reference only, not a stage."
             SELECT COUNT(*) AS n FROM external_transactions
-            WHERE source_code IN ('ebay','goldin','fanatics','heritage','pwcc')
-              AND verified_price_eligible = TRUE
-              AND (source_code <> 'ebay' OR best_offer = FALSE)
+            {ext_where}
         )
         SELECT pending.n, identified.n, trusted.n, mazified.n, external.n
         FROM pending, identified, trusted, mazified, external
     """
+    sql = sql.format(ext_where=external_total_where(obo == "exclude"))
     try:
         with neon_conn() as c:
             cur = c.cursor()
@@ -1959,6 +2197,12 @@ def row_detail(
         chosen["mazified_blockers"] = mazified_blockers(chosen)
         chosen["hard_block_strip"] = row_hard_block_labels(chosen)
         chosen["market_comps"] = _market_comps_for_row(chosen)
+        # Zero-comp deliberate state (rare_by_design / pending_fill /
+        # coverage_gap). Attached ONLY when the exact-card comps list is
+        # empty; rows with comps keep their existing payload untouched.
+        if not chosen["market_comps"]:
+            chosen["no_comp_state"] = _no_comp_state(
+                None, str(chosen.get("source_key") or ""), chosen, chosen["market_comps"])
         # Advisory audio (transcript excerpt + audio-derived identity) for the
         # AUDIO CALLOUT drawer bar. No-op when the row has no indexed audio.
         attach_audio_evidence(chosen)
