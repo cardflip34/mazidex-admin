@@ -537,27 +537,40 @@ def refresh_stage1_views(conn_obj: Any) -> None:
     cur.execute("DROP VIEW IF EXISTS stage1_trusted_sales_current")
     cur.execute(
         """
+        -- year: COALESCE the certified/manual gtr_year_overrides (migration 020 + core repo
+        -- migration 023). The years are SCP+eBay cross-confirmed and the comp matcher already
+        -- consumes them via identity_from_row; without this join the Trusted tab / front end
+        -- renders them BLANK (965 rows on 2026-07-29). Fill-blank-only: a row's own non-empty
+        -- year always wins. gtr_year_overrides.source_key is the PK, so the LEFT JOIN cannot
+        -- multiply rows. NOTE: this function DROPs+CREATEs the view on every promotion, so any
+        -- fix applied only to the live DB is transient — it must live HERE.
         CREATE VIEW stage1_trusted_sales_current AS
         SELECT
             NULL::bigint AS feed_observation_id,
-            source_key, 'trusted'::text AS observed_in, comp_id, review_id, trust_bucket, trust_score, risk_level,
-            source_file, auction_number, seller, sold_price, feed_generated_at, first_seen_at,
-            last_seen_at, feed_count, feed_card_id, title, card_name, player, brand, set_name,
-            variant, year, grade, grade_chip, condition, category, sport, image_front_neon_url,
-            image_back_neon_url, image_front, image_back, last_sale_date, pending_reasons,
-            warnings, review_decision, review_notes, reviewed_by, reviewed_at, raw
-        FROM stage1_trusted_historical_resweep_rows
-        WHERE stage1_state = 'trusted'
+            t.source_key, 'trusted'::text AS observed_in, t.comp_id, t.review_id, t.trust_bucket, t.trust_score, t.risk_level,
+            t.source_file, t.auction_number, t.seller, t.sold_price, t.feed_generated_at, t.first_seen_at,
+            t.last_seen_at, t.feed_count, t.feed_card_id, t.title, t.card_name, t.player, t.brand, t.set_name,
+            t.variant, COALESCE(NULLIF(btrim(t.year), ''), gyo.year) AS year,
+            t.grade, t.grade_chip, t.condition, t.category, t.sport, t.image_front_neon_url,
+            t.image_back_neon_url, t.image_front, t.image_back, t.last_sale_date, t.pending_reasons,
+            t.warnings, t.review_decision, t.review_notes, t.reviewed_by, t.reviewed_at, t.raw
+        FROM stage1_trusted_historical_resweep_rows t
+        LEFT JOIN gtr_year_overrides gyo
+               ON gyo.source_key = t.source_key AND gyo.state IN ('certified', 'manual')
+        WHERE t.stage1_state = 'trusted'
         UNION ALL
         SELECT
             NULL::bigint AS feed_observation_id,
-            source_key, 'trusted'::text AS observed_in, comp_id, review_id, trust_bucket, trust_score, risk_level,
-            source_file, auction_number, seller, sold_price, feed_generated_at, first_seen_at,
-            last_seen_at, feed_count, feed_card_id, title, card_name, player, brand, set_name,
-            variant, year, grade, grade_chip, condition, category, sport, image_front_neon_url,
-            image_back_neon_url, image_front, image_back, last_sale_date, pending_reasons,
-            warnings, review_decision, review_notes, reviewed_by, reviewed_at, raw
-        FROM stage1_trusted_promotion_rows
+            p.source_key, 'trusted'::text AS observed_in, p.comp_id, p.review_id, p.trust_bucket, p.trust_score, p.risk_level,
+            p.source_file, p.auction_number, p.seller, p.sold_price, p.feed_generated_at, p.first_seen_at,
+            p.last_seen_at, p.feed_count, p.feed_card_id, p.title, p.card_name, p.player, p.brand, p.set_name,
+            p.variant, COALESCE(NULLIF(btrim(p.year), ''), gyo.year) AS year,
+            p.grade, p.grade_chip, p.condition, p.category, p.sport, p.image_front_neon_url,
+            p.image_back_neon_url, p.image_front, p.image_back, p.last_sale_date, p.pending_reasons,
+            p.warnings, p.review_decision, p.review_notes, p.reviewed_by, p.reviewed_at, p.raw
+        FROM stage1_trusted_promotion_rows p
+        LEFT JOIN gtr_year_overrides gyo
+               ON gyo.source_key = p.source_key AND gyo.state IN ('certified', 'manual')
         """
     )
     cur.execute(
