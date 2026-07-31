@@ -676,6 +676,7 @@ SOURCE_QUEUE_MAP: dict[str, str | None] = {
     "identified":         "identified_view",
     "trusted":            "trusted_view",
     "mazified":           "mazified",
+    "trusted_review":     "trusted_review",
     "flagged_review":     "flagged_review",
     "working_queue":      "working",
     "ebay":               None,   # external — served by external_sql()

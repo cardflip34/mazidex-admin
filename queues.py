@@ -473,6 +473,53 @@ MAZIFIED_SQL = f"""
 """
 
 
+# ============================================================================
+# TRUSTED REVIEW (2026-07-30, operator-directed; replaces the retired Mazified
+# tab). The good-sale / imperfect-image lane: card identity, price and auction
+# binding all verify — the ONLY thing keeping the row out of ADMIT is the
+# front-image classification. A human approves rows here via the normal confirm
+# path; promote_to_trusted still enforces every hard block server-side
+# (non-single types, card_count>=2, watermark/binding mismatch, banned sellers,
+# duplicate-sale guard), so this tab can never smuggle a bad row into Trusted.
+# Display-side SQL approximation of the measured python-gate rule; promotion
+# remains the authority. Rows are mostly Phase-2 retro-bind output
+# (raw.retro_bind marker), which also makes promotion_path derivable later.
+# ============================================================================
+_TRUSTED_REVIEW_WHERE = f"""
+      (review_decision IS NULL OR btrim(review_decision) = '')
+      AND sold_price > 0 AND sold_price <= 50000
+      AND NOT (COALESCE(auction_number::text,'') ~ '^9[0-9]{{4,}}$')
+      AND raw->'api_scan'->>'mazi_watermark_verification' = 'matches_expected'
+      AND COALESCE(raw->'evidence_stamp'->>'expected_auction_number','')
+          = COALESCE(auction_number::text,'')
+      AND player IS NOT NULL AND player ~ '[A-Za-z]{{2,}}.*[A-Za-z]{{2,}}'
+      AND player !~* 'multiple players|unknown|placeholder'
+      AND COALESCE(raw->>'auction_type','') NOT IN
+          ('bundle','multi-card','multi_card','lot','mystery')
+      AND NOT (COALESCE(raw->'api_scan'->>'card_count','') ~ '^[2-9][0-9]*$')
+      AND COALESCE(raw->>'front_image_status','') NOT IN
+          ('valid_card_front','displayable_for_identified_review','mini_intake_classical_front')
+      AND ( (year IS NOT NULL AND btrim(year) <> '')
+            OR EXISTS (SELECT 1 FROM gtr_year_overrides g
+                        WHERE g.source_key = identified_sales_current.source_key
+                          AND g.state IN ('certified','manual')) )
+      AND (COALESCE(btrim(brand),'') <> '' OR COALESCE(btrim(set_name),'') <> '')
+      -- NOTE deliberately NO anti-join against stage1_trusted_sales_current: the
+      -- identified_sales_current view already excludes promoted rows (its arm has
+      -- NOT EXISTS promotion_rows), and promoted rows carry review_decision anyway.
+      -- Measured 2026-07-30: that anti-join cost 78s of an 80s count and filtered 0 rows.
+      AND {HIDDEN_EXCLUSION}
+"""
+
+TRUSTED_REVIEW_SQL = f"""
+    SELECT {ROW_FIELDS}, 'trusted_review_image_exception' AS queue_reason
+    FROM identified_sales_current
+    WHERE {_TRUSTED_REVIEW_WHERE}
+    ORDER BY sold_price DESC NULLS LAST
+    LIMIT %s
+"""
+
+
 FLAGGED_REVIEW_SQL = f"""
     SELECT {ROW_FIELDS}
     FROM operational_pending_sales
@@ -528,6 +575,7 @@ QUEUE_MAP: dict[str, str] = {
     "chrome_advanced": CHROME_ADVANCED_SQL,
     "human_review_ai_approved": HUMAN_REVIEW_AI_APPROVED_SQL,
     "mazified": MAZIFIED_SQL,
+    "trusted_review": TRUSTED_REVIEW_SQL,
     "flagged_review": FLAGGED_REVIEW_SQL,
     "rejected_hidden": REJECTED_HIDDEN_SQL,
     "trusted_view": TRUSTED_VIEW_SQL,
@@ -1116,6 +1164,10 @@ QUEUE_COUNTS_SQL = f"""
         ORDER BY source_key, created_at DESC
     ) latest
     WHERE latest.decision = 'human_confirmed_for_final_gate'
+    UNION ALL
+    SELECT 'trusted_review', COUNT(*)
+    FROM identified_sales_current
+    WHERE {_TRUSTED_REVIEW_WHERE}
     UNION ALL
     SELECT 'mazified', COUNT(*)
     FROM (
