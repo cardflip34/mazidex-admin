@@ -54,6 +54,7 @@ const SOURCE_TO_QUEUE = {
   identified:       'identified_view',
   trusted:          'trusted_view',
   mazified:         'mazified',
+  trusted_review:   'trusted_review',
   flagged_review:   'flagged_review',
   working_queue:    'working',
   ebay:             null,   // served by /api/v1/source (external)
