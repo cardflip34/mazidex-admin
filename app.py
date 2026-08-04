@@ -679,6 +679,7 @@ SOURCE_QUEUE_MAP: dict[str, str | None] = {
     "trusted_review":     "trusted_review",
     "flagged_review":     "flagged_review",
     "working_queue":      "working",
+    "priceless_identified": "priceless_identified",
     "ebay":               None,   # external — served by external_sql()
     "goldin":             None,   # external — served by external_sql()
     "fanatics":           None,
@@ -2015,10 +2016,17 @@ def stats_header(
     }
     sql = """
         WITH pending AS (
+            -- 2026-08-03: never-priced rows are excluded from the Pending Review
+            -- surface (they live on the PRICELESS IDENTIFIED tab), so the hero
+            -- count matches what the tab shows.
             SELECT COUNT(*) AS n FROM operational_pending_sales
+            WHERE sold_price IS NOT NULL
         ),
         identified AS (
+            -- 2026-08-03: matches the Identified tab (never-priced rows are
+            -- counted by the PRICELESS IDENTIFIED tab instead).
             SELECT COUNT(*) AS n FROM identified_sales_current
+            WHERE sold_price IS NOT NULL
         ),
         trusted AS (
             SELECT COUNT(*) AS n FROM stage1_trusted_sales_current

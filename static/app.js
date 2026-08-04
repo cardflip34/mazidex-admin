@@ -57,6 +57,7 @@ const SOURCE_TO_QUEUE = {
   trusted_review:   'trusted_review',
   flagged_review:   'flagged_review',
   working_queue:    'working',
+  priceless_identified: 'priceless_identified',
   ebay:             null,   // served by /api/v1/source (external)
   goldin:           null,   // served by /api/v1/source (external)
   fanatics:         null,

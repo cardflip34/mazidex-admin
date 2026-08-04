@@ -313,6 +313,10 @@ WORKING_QUEUE_SQL = f"""
               'FLAG_REVIEW', 'RAW_ONLY', 'TRUSTED_CANDIDATE',
               'REVIEW_HIGH_VALUE'
           )
+      -- 2026-08-03 priceless-Identified lane: never-priced rows can't clear
+      -- require_sold_price, so review time here is wasted on them. They are
+      -- browsable on the PRICELESS IDENTIFIED tab instead.
+      AND sold_price IS NOT NULL
       AND {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
@@ -557,7 +561,24 @@ TRUSTED_VIEW_SQL = f"""
 IDENTIFIED_VIEW_SQL = f"""
     SELECT {ROW_FIELDS}, 'identified_front_gemini_sweep' AS queue_reason
     FROM identified_sales_current
-    WHERE {HIDDEN_EXCLUSION}
+    -- 2026-08-03 (operator-approved): never-priced rows live ONLY on the
+    -- PRICELESS IDENTIFIED tab — no double-listing here.
+    WHERE sold_price IS NOT NULL
+      AND {HIDDEN_EXCLUSION}
+    ORDER BY last_seen_at DESC NULLS LAST
+    LIMIT %s
+"""
+
+# 2026-08-03 priceless-Identified lane: Identified rows whose sold_price never
+# existed upstream (capture-time loss, 0% recoverable — see whatnot-sniper-m4
+# docs/PRICELESS_IDENTIFIED_PHASE0_20260803.html). Stamped MISSING_SOLD_PRICE.
+# Held + browsable here, excluded from the Pending Review working queue;
+# require_sold_price still hard-blocks promotion server-side.
+PRICELESS_IDENTIFIED_SQL = f"""
+    SELECT {ROW_FIELDS}, 'missing_sold_price' AS queue_reason
+    FROM identified_sales_current
+    WHERE sold_price IS NULL
+      AND {HIDDEN_EXCLUSION}
     ORDER BY last_seen_at DESC NULLS LAST
     LIMIT %s
 """
@@ -565,6 +586,7 @@ IDENTIFIED_VIEW_SQL = f"""
 
 QUEUE_MAP: dict[str, str] = {
     "identified_view": IDENTIFIED_VIEW_SQL,
+    "priceless_identified": PRICELESS_IDENTIFIED_SQL,
     "working": WORKING_QUEUE_SQL,
     "high_value": HIGH_VALUE_SQL,
     "proof_review": PROOF_REVIEW_SQL,
@@ -1078,11 +1100,13 @@ def external_total_where(obo_exclude: bool = False) -> str:
 QUEUE_COUNTS_SQL = f"""
     SELECT 'identified_view' AS name, COUNT(*) AS n
     FROM identified_sales_current
-    WHERE {HIDDEN_EXCLUSION}
+    WHERE sold_price IS NOT NULL  -- lockstep with IDENTIFIED_VIEW_SQL (2026-08-03)
+      AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'working' AS name, COUNT(*) AS n
     FROM operational_pending_sales
     WHERE trust_bucket IN ('FLAG_REVIEW','RAW_ONLY','TRUSTED_CANDIDATE','REVIEW_HIGH_VALUE')
+      AND sold_price IS NOT NULL  -- keep in lockstep with WORKING_QUEUE_SQL (2026-08-03)
       AND {HIDDEN_EXCLUSION}
     UNION ALL
     SELECT 'high_value', COUNT(*)
@@ -1193,4 +1217,9 @@ QUEUE_COUNTS_SQL = f"""
     UNION ALL
     SELECT 'trusted_view', COUNT(*) FROM stage1_trusted_sales_current
     WHERE {HIDDEN_EXCLUSION}
+    UNION ALL
+    SELECT 'priceless_identified', COUNT(*)
+    FROM identified_sales_current
+    WHERE sold_price IS NULL
+      AND {HIDDEN_EXCLUSION}
 """
