@@ -292,6 +292,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(HERE, "static")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# MVE panel (Phase 3, additive, read-only; reads ~/MAZI-VALUE-ESTIMATE local stores only)
+try:
+    from mve_panel import mve_router
+    app.include_router(mve_router)
+except Exception as _mve_err:  # engine repo absent -> workbench unaffected
+    print(f"[mve_panel] not mounted: {_mve_err}", file=sys.stderr)
+
+
 
 # ============================================================================
 # Audit-only price ladder badges
