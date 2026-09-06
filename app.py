@@ -58,6 +58,7 @@ from config import (
     review_write_scope_identified_all,
     review_write_enabled,
     row_actions_write_enabled,
+    private_trusted_review_promote_enabled,
 )
 from decisions import (
     DB_VALID_DECISIONS,
@@ -83,6 +84,9 @@ from row_actions import (
     build_delete_record,
     pick_deletable_row,
     soft_delete_payload,
+    PRIVATE_TRUSTED_DECISION,
+    private_trusted_blockers,
+    private_trusted_payload,
 )
 from queues import (
     DECISIONS_SQL,
@@ -1061,16 +1065,32 @@ def _resolve_display_images(row: dict[str, Any]) -> None:
     # the clean crops. The frontend badges is_review_frame so a reviewer is never
     # misled into reading a stream frame as a clean identified card image.
     _orig_front_status = str(row.get("front_image_status") or "").strip().lower()
-    row["is_review_frame"] = _orig_front_status in (
+    # A rescued review-front row (migration 025) is ALSO a review frame: its only
+    # image is a watermarked countdown frame, never a clean card crop. Badging it is
+    # what lets a reviewer do the visual half of the private-Trusted confirmation
+    # without being misled into reading it as an official front.
+    _review_front = str(row.get("image_review_front") or "").strip()
+    row["is_review_frame"] = bool(_review_front) or _orig_front_status in (
         "recovery_display_front",
         "displayable_for_identified_review",
     )
+    row["review_front_only"] = bool(_review_front) and not str(
+        row.get("image_front") or ""
+    ).strip()
     official_front_basename = extract_basename(
         row.get("image_front_neon_url"),
         row.get("image_front"),
     )
     ops_display_image_value = ""
     for candidate in (
+        # First: the watermark-verified review front, when the importer admitted one.
+        # This is a provable no-op for every pre-existing row -- image_review_front is
+        # a NEW column and is NULL everywhere until the flag-gated importer path
+        # populates it. It flows through the SAME recovery channel as
+        # ops_display_image, so it lands in image_front_basename ONLY with
+        # image_front_is_ops_display=True (i.e. flagged as recovered, never official),
+        # and the proof_/cdn_ suppression below still applies to it.
+        row.get("image_review_front"),
         row.get("ops_display_image"),
         row.get("review_context_image"),
         row.get("review_context_image_first"),
@@ -1838,6 +1858,8 @@ def queue(
             total_count = int(rows[0].pop("__total_count", 0) or 0)
             for row in rows[1:]:
                 row.pop("__total_count", None)
+            for row in rows:
+                row.pop("__raw", None)
         payload = {
             "name": name,
             "row_count": len(rows),
@@ -2657,6 +2679,166 @@ async def row_action_delete(request: Request) -> JSONResponse:
                     "error": "db_check_violation",
                     "reason": f"{type_name}: {str(e)[:300]}",
                     "hint": "Apply migration 019 to allow deleted_from_8504 before posting.",
+                },
+                status_code=422,
+            )
+        return _json({"error": "internal_error", "type": type_name}, status_code=500)
+
+
+# ============================================================================
+# PRIVATE-TRUSTED (watermark + visual) row action — PART B, 2026-09-05
+# ============================================================================
+# Scoped to identified_sales_current ONLY, and to rescued review-front rows within
+# it. Queried directly rather than through ROW_BY_SOURCE_KEY_SQL because that query
+# UNIONs five relations over a shared ROW_FIELDS list and only this one carries
+# image_review_front (migration 025).
+PRIVATE_TRUSTED_ROW_SQL = """
+    SELECT 'identified' AS source_view,
+           source_key, comp_id, review_id, source_file, auction_number, seller,
+           sold_price, player, year, set_name, grade_chip,
+           image_front, image_front_neon_url, image_review_front,
+           review_decision, raw
+      FROM identified_sales_current
+     WHERE source_key = %s
+     LIMIT 1
+"""
+
+
+@app.post("/api/v1/row-action/private-trusted")
+async def row_action_private_trusted(request: Request) -> JSONResponse:
+    """8504 PRIVATE-TRUSTED row action — human-click only, watermark + visual.
+
+    Records the INTERNAL state `private_trusted_watermark_visual` for a rescued
+    review-front row after BOTH (i) a machine-checked watermark read-back of
+    matches_expected against the row's own auction_number and (ii) an explicit
+    human visual confirmation posted as visual_confirmed=true.
+
+    THIS IS NOT A PROMOTION. It appends ONE append-only review_decision_events row.
+    It does not call promote_identified_to_trusted and writes nothing to
+    stage1_trusted_promotion_rows — the only relation stage1_trusted_sales_current
+    reads. It is not 'confirm', so trusted_sales_current (whose pending branch
+    requires exactly 'confirm') cannot see it either. The auto-promote daemon can
+    never reach these rows: its candidate window is filtered to
+    front_image_status IN trusted_gate.FRONT_ALLOW and these are
+    'missing_or_context_only' (FRONT_HOLD). Not public Trusted, not MAZIFIED, not a
+    cert, never eligible for public MaziDex.
+
+    Gated CLOSED by default behind THREE flags — MAZIDEX_ADMIN_REVIEW_WRITE_ENABLED,
+    MAZIDEX_ADMIN_ROW_ACTIONS_WRITE_ENABLED and MAZI_PRIVATE_TRUSTED_REVIEW_PROMOTE —
+    so the route ships inert. Migration 026 must be applied or the DB CHECK rejects
+    the decision (surfaced as 422). Reversible: a later 'clear' supersedes it.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"error": "malformed_json"}, status_code=400)
+
+    source_key = str(body.get("source_key") or "").strip()
+    if not source_key:
+        return _json({"error": "missing_source_key"}, status_code=400)
+    reviewer = str(body.get("reviewer") or body.get("operator") or "").strip()
+    if not reviewer:
+        # Reviewer identity is audit-required for this action; no silent default.
+        return _json({"error": "missing_reviewer"}, status_code=400)
+    # Must be the literal boolean true — a truthy string is NOT a human confirmation.
+    visual_confirmed = body.get("visual_confirmed") is True
+    notes = body.get("notes")
+
+    if not (review_write_enabled()
+            and row_actions_write_enabled()
+            and private_trusted_review_promote_enabled()):
+        return _json(
+            {
+                "error": "private_trusted_write_disabled",
+                "message": (
+                    "The private-Trusted row action is gated CLOSED. After operator "
+                    "approval set MAZIDEX_ADMIN_REVIEW_WRITE_ENABLED=1 AND "
+                    "MAZIDEX_ADMIN_ROW_ACTIONS_WRITE_ENABLED=1 AND "
+                    "MAZI_PRIVATE_TRUSTED_REVIEW_PROMOTE=1, and apply migration 026. "
+                    "Validated request echoed for dry-run."
+                ),
+                "validated_request": {
+                    "action": "private_trusted",
+                    "source_key": source_key,
+                    "reviewer": reviewer,
+                    "visual_confirmed": visual_confirmed,
+                },
+                "would_write_to": "review_decision_events",
+                "would_write_decision": PRIVATE_TRUSTED_DECISION,
+                "is_public_trusted": False,
+                "is_mazified": False,
+                "public_mazidex_eligible": False,
+            },
+            status_code=503,
+        )
+
+    try:
+        with neon_conn() as c:
+            cur = c.cursor()
+            cur.execute(PRIVATE_TRUSTED_ROW_SQL, (source_key,))
+            fetched = cur.fetchone()
+            if fetched is None:
+                return _json(
+                    {"error": "source_key_not_found_in_identified",
+                     "source_key": source_key},
+                    status_code=404,
+                )
+            row = dict(zip([d.name for d in cur.description], fetched))
+
+            blockers = private_trusted_blockers(row, visual_confirmed=visual_confirmed)
+            if blockers:
+                return _json(
+                    deep_scrub({
+                        "error": "private_trusted_gate_failed",
+                        "message": (
+                            "Requires a rescued review-front row with a "
+                            "matches_expected watermark read-back bound to this "
+                            "auction, plus an explicit human visual confirmation."
+                        ),
+                        "source_key": source_key,
+                        "blockers": blockers,
+                    }),
+                    status_code=409,
+                )
+
+            payload = private_trusted_payload(
+                row, reviewer=reviewer, notes=notes,
+                visual_confirmed=visual_confirmed,
+            )
+            result = write_decision(c, payload, write_enabled=True)
+        return _json(
+            deep_scrub({
+                "status": PRIVATE_TRUSTED_DECISION,
+                "source_key": source_key,
+                "event_id": result.get("event_id"),
+                "created_at": result.get("created_at"),
+                "reviewer": reviewer,
+                "basis": "watermark_readback_plus_human_visual",
+                # Restated on the response so no caller can mistake this for Trusted.
+                "is_public_trusted": False,
+                "is_mazified": False,
+                "is_cert": False,
+                "public_mazidex_eligible": False,
+                "auto_promotable": False,
+                "promoted_to_trusted": False,
+                "wrote_to_stage1_trusted_promotion_rows": False,
+                "reversible_via": "clear",
+            }),
+            status_code=201,
+        )
+    except PermissionError:
+        return _json({"error": "review_write_disabled"}, status_code=503)
+    except ValueError as e:
+        return _json({"error": "invalid_payload", "reason": str(e)}, status_code=400)
+    except Exception as e:
+        type_name = type(e).__name__
+        if "CheckViolation" in type_name or "IntegrityError" in type_name:
+            return _json(
+                {
+                    "error": "db_check_violation",
+                    "reason": f"{type_name}: {str(e)[:300]}",
+                    "hint": ("Apply migration 026 to allow "
+                             "private_trusted_watermark_visual before posting."),
                 },
                 status_code=422,
             )

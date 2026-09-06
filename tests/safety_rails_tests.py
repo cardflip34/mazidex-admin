@@ -72,10 +72,25 @@ check(
     is_db_supported_decision("mazified"),
     f"is_db_supported_decision('mazified')={is_db_supported_decision('mazified')}",
 )
+# This rail pins the EXACT set of decisions that may be written to the DB. It is
+# meant to trip whenever a new one is added, so each addition is a conscious act.
+# 2026-09-05: private_trusted_watermark_visual added (migration 026). Like
+# deleted_from_8504 it is row-action-ONLY -- written solely by its dedicated route,
+# never reachable through the generic /api/v1/review-decision endpoint (which accepts
+# only 'confirm'). It records an INTERNAL private-review state; it is not 'confirm',
+# so it can never enter trusted_sales_current, and it writes nothing to
+# stage1_trusted_promotion_rows, so it can never enter stage1_trusted_sales_current.
 check(
-    "T1e DB_VALID_DECISIONS is the 7 generic + deleted_from_8504 row-action",
-    DB_VALID_DECISIONS == frozenset({"confirm","flag","reject","workable","clear","mazified","deny","deleted_from_8504"}),
+    "T1e DB_VALID_DECISIONS is the 7 generic + 2 row-action decisions",
+    DB_VALID_DECISIONS == frozenset({"confirm","flag","reject","workable","clear","mazified","deny",
+                                     "deleted_from_8504","private_trusted_watermark_visual"}),
     f"DB_VALID_DECISIONS={sorted(DB_VALID_DECISIONS)}",
+)
+check(
+    "T1f private_trusted_watermark_visual is row-action-only (never the generic menu)",
+    "private_trusted_watermark_visual" not in row_allowed_decisions(
+        {"source_view": "identified", "raw": {}}),
+    "generic menu must never offer the private-Trusted decision",
 )
 
 

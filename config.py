@@ -77,6 +77,25 @@ def row_actions_write_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def private_trusted_review_promote_enabled() -> bool:
+    """Runtime gate for the PRIVATE-TRUSTED (watermark + visual) row action.
+
+    Its own flag, independent of both the Confirm->Trusted promotion scope and the
+    DELETE/SWAP row-action gate, so it can be opened without opening anything else.
+    The route requires review_write_enabled() AND row_actions_write_enabled() AND
+    this flag, so it ships completely inert. Migration 026 must be applied first or
+    the DB CHECK rejects `private_trusted_watermark_visual`.
+
+    NOTE ON WHAT THIS IS NOT: private_trusted_watermark_visual is an INTERNAL state
+    backed by watermark read-back + human visual confirmation. It is NOT public
+    Trusted, NOT a MAZIFIED RECORD, and NOT a cert. It is never reachable by the
+    auto-promote daemon and never eligible for public MaziDex.
+    """
+    return os.environ.get(
+        "MAZI_PRIVATE_TRUSTED_REVIEW_PROMOTE", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Backward-compatible snapshot for older imports. New code should call
 # review_write_enabled() so health, UI copy, and POST behavior agree.
 REVIEW_WRITE_ENABLED = review_write_enabled()
@@ -105,6 +124,11 @@ VALID_DECISIONS = frozenset({
     # keep-one-image / JSONL / image-swap side effects.
     "deleted_from_8504",
     "front_swapped",
+    # PRIVATE-TRUSTED (watermark + visual) row action. Like the two above it is
+    # written ONLY by its dedicated route -- it is listed here so the generic
+    # decision endpoint recognizes the payload shape and returns a friendly 422
+    # rather than a bare "unknown decision".
+    "private_trusted_watermark_visual",
     # Legacy 9009 decision types (preserved for parity)
     "confirm",
     "flag",

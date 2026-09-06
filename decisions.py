@@ -62,6 +62,17 @@ DB_VALID_DECISIONS = frozenset({
     # endpoint: that route's write stage accepts only decision=='confirm'
     # (every other decision -> 403 write_scope_closed). Reversible via 'clear'.
     "deleted_from_8504",
+    # PRIVATE-TRUSTED (watermark + visual), migration 026. DB-supported so the
+    # dedicated route can write it through the single write_decision INSERT path.
+    # It can NEVER leak through the generic /api/v1/review-decision endpoint: that
+    # route's write stage accepts only decision=='confirm' (everything else ->
+    # 403 write_scope_closed). Reversible via 'clear'.
+    #
+    # This decision does NOT promote anything. It records an internal, private
+    # review state; no code path unions it into trusted_sales_current (which
+    # requires 'confirm') or stage1_trusted_sales_current (which reads only the
+    # stage1_trusted_* tables, written solely by promote_identified_to_trusted).
+    "private_trusted_watermark_visual",
 })
 
 
@@ -71,6 +82,7 @@ DB_VALID_DECISIONS = frozenset({
 # its own button with its own keep-one-image / JSONL side effects.
 _ROW_ACTION_ONLY_DECISIONS = frozenset({
     "deleted_from_8504",
+    "private_trusted_watermark_visual",
 })
 
 

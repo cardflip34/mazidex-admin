@@ -172,6 +172,16 @@ def _row_fields(prefix: str = "") -> str:
 ROW_FIELDS = _row_fields("")
 ROW_FIELDS_OFS = _row_fields("ofs")
 
+# Fast-path projections (2026-08-28): page first on slim rows, extract later.
+# _SLIM_FIELDS keeps every direct table column plus the raw jsonb as an
+# untouched TOAST pointer; the ~60 _RAW_EXTRACTS then run only on the
+# LIMIT-sized page in the outer query. This keeps the big list queues from
+# detoasting the entire heap before LIMIT can apply.
+_SLIM_FIELDS = ",\n    ".join([*_BASE_FIELDS, "raw AS __raw"])
+_OUTER_EXTRACTS = ",\n    ".join(
+    f"p.__raw {expr} AS {alias}" for expr, alias in _RAW_EXTRACTS
+)
+
 
 # ---------------------------------------------------------------------------
 # queue_reason CASE expressions (2026-05-30, senior-pass)
@@ -715,13 +725,35 @@ def _dynamic_queue_sql(
     if search_filter:
         filters.append(search_filter)
     where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+    order_sql = _dynamic_order_sql(sort)
+    # Fast path: no search filter (search predicates reference extract aliases
+    # like api_scan_*, which only exist in the full-width shape) and a base
+    # that embeds the standard unprefixed ROW_FIELDS. Slim phase keeps raw as
+    # a TOAST pointer so the top-N sort and window count handle narrow tuples;
+    # extracts run on just the returned page. app.py drops __raw from rows.
+    if not search_filter and ROW_FIELDS in base:
+        slim = base.replace(ROW_FIELDS, _SLIM_FIELDS)
+        return f"""
+    SELECT p.*, {_OUTER_EXTRACTS}
+    FROM (
+        SELECT q.*, count(*) OVER() AS __total_count
+        FROM (
+{slim}
+        ) q
+        {where_sql}
+        ORDER BY {order_sql}
+        LIMIT %s
+        OFFSET %s
+    ) p
+    ORDER BY {order_sql.replace("q.", "p.")}
+""", params
     return f"""
     SELECT q.*, count(*) OVER() AS __total_count
     FROM (
 {base}
     ) q
     {where_sql}
-    ORDER BY {_dynamic_order_sql(sort)}
+    ORDER BY {order_sql}
     LIMIT %s
     OFFSET %s
 """, params
@@ -828,36 +860,57 @@ ROW_DETAIL_SQL = f"""
 """
 
 
+# REVIEW-FRONT column for the drawer (migration 025). ROW_FIELDS is shared across
+# all five UNION branches, but only identified_sales_current carries
+# image_review_front -- so it is added PER BRANCH here, NULL on the other four.
+#
+# The identified branch reads it through to_jsonb(...)->>'image_review_front' rather
+# than as a bare column reference ON PURPOSE: the 8504 is live infrastructure, and a
+# bare reference would make this query -- the single-row drawer for EVERY surface --
+# fail hard if this code were ever deployed before migration 025 lands. Through
+# to_jsonb an absent key is simply NULL, so the drawer keeps working either way and
+# the column starts returning data the moment the migration is applied. Cost is
+# negligible: this query fetches one row by source_key.
+_REVIEW_FRONT_NULL = "NULL::text AS image_review_front"
+_REVIEW_FRONT_IDENTIFIED = (
+    "(to_jsonb(identified_sales_current.*) ->> 'image_review_front') AS image_review_front"
+)
+
 ROW_BY_SOURCE_KEY_SQL = f"""
     SELECT 'mazified' AS source_view,
            {ROW_FIELDS},
-           raw AS raw_full
+           raw AS raw_full,
+           {_REVIEW_FRONT_NULL}
     FROM operational_feed_sales
     WHERE source_key = %s
       AND review_decision = 'mazified'
     UNION ALL
     SELECT 'feed' AS source_view,
            {ROW_FIELDS},
-           raw AS raw_full
+           raw AS raw_full,
+           {_REVIEW_FRONT_NULL}
     FROM operational_feed_sales
     WHERE source_key = %s
       AND COALESCE(review_decision, '') <> 'mazified'
     UNION ALL
     SELECT 'pending' AS source_view,
            {ROW_FIELDS},
-           raw AS raw_full
+           raw AS raw_full,
+           {_REVIEW_FRONT_NULL}
     FROM operational_pending_sales
     WHERE source_key = %s
     UNION ALL
     SELECT 'identified' AS source_view,
            {ROW_FIELDS},
-           raw AS raw_full
+           raw AS raw_full,
+           {_REVIEW_FRONT_IDENTIFIED}
     FROM identified_sales_current
     WHERE source_key = %s
     UNION ALL
     SELECT 'trusted' AS source_view,
            {ROW_FIELDS},
-           raw AS raw_full
+           raw AS raw_full,
+           {_REVIEW_FRONT_NULL}
     FROM stage1_trusted_sales_current
     WHERE source_key = %s
     LIMIT 50

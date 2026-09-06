@@ -251,3 +251,157 @@ def append_delete_record(
     with open(path, "a", encoding="utf-8") as fh:
         fh.write(line + "\n")
     return path
+
+
+# ===========================================================================
+# PRIVATE-TRUSTED (watermark + visual) row action — PART B, 2026-09-05.
+#
+# A reviewer promotes a RESCUED review-front row to the INTERNAL state
+# `private_trusted_watermark_visual` after BOTH:
+#   (i)  the watermark read-back == matches_expected against the row's own
+#        auction_number (machine-checkable — enforced here), and
+#   (ii) an explicit human visual confirmation (the client must post
+#        visual_confirmed=true; the button cannot be scripted past this).
+#
+# WHAT THIS STATE IS NOT — restated in code as required by the lane command:
+#   * NOT public Trusted. trusted_sales_current admits a pending row only on
+#     review_decision='confirm'; this is not 'confirm'.
+#   * NOT a MAZIFIED RECORD and NOT a cert. It is watermark + visual evidence.
+#   * NEVER reachable by the auto-promote daemon. The daemon selects candidates
+#     under --require-front-allow (front_image_status IN trusted_gate.FRONT_ALLOW);
+#     these rows are 'missing_or_context_only' -> FRONT_HOLD. It reads
+#     review_decision only to HOLD an already-decided row, so this decision makes
+#     the daemon strictly more conservative.
+#   * NEVER eligible for public MaziDex.
+#
+# This action does NOT call promote_identified_to_trusted and writes nothing to
+# stage1_trusted_promotion_rows — the only relation stage1_trusted_sales_current
+# reads. It appends ONE append-only review_decision_events row. Reversible by a
+# later 'clear'.
+# ===========================================================================
+
+PRIVATE_TRUSTED_DECISION = "private_trusted_watermark_visual"
+
+# Only rescued review-front rows are in scope. A row with a real official front
+# is NOT this action's business — it has the ordinary Trusted path available.
+PRIVATE_TRUSTED_SOURCE_VIEWS = ("identified",)
+
+# The read-back verdicts that count as PROVEN. Mirrors trusted_gate.check_binding's
+# `proven` arm exactly: a self-consistent "we stamped it" status is NOT enough.
+PRIVATE_TRUSTED_READBACK_OK = frozenset({"matches_expected"})
+
+
+def _auction_text(value: Any) -> str:
+    """Normalize an auction number for comparison ('#799', '799.0' -> '799')."""
+    text = _clean_str(value).lstrip("#").strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
+def _raw_of(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw")
+    return raw if isinstance(raw, dict) else {}
+
+
+def private_trusted_blockers(row: dict[str, Any], *, visual_confirmed: bool) -> list[str]:
+    """Return the reasons this row may NOT be privately promoted. Empty == eligible.
+
+    Pure function over a DB row. Fail-closed: every unknown or absent value is a
+    blocker, never a pass.
+    """
+    blockers: list[str] = []
+    if not isinstance(row, dict):
+        return ["row_missing"]
+    raw = _raw_of(row)
+    api = raw.get("api_scan") if isinstance(raw.get("api_scan"), dict) else {}
+    stamp = raw.get("evidence_stamp") if isinstance(raw.get("evidence_stamp"), dict) else {}
+
+    # (ii) explicit human visual confirmation — never inferable from data.
+    if not visual_confirmed:
+        blockers.append("visual_confirmation_required")
+
+    # Scope: a rescued review-front row only.
+    if resolve_source_view(row) not in PRIVATE_TRUSTED_SOURCE_VIEWS:
+        blockers.append("not_an_identified_row")
+    if not _clean_str(row.get("image_review_front")):
+        blockers.append("no_review_front")
+    if _clean_str(row.get("image_front")) or _clean_str(row.get("image_front_neon_url")):
+        # Has a real front -> the ordinary Trusted path applies, not this one.
+        blockers.append("row_has_official_front")
+    if _clean_str(raw.get("front_image_status")).lower() != "missing_or_context_only":
+        blockers.append("unexpected_front_image_status")
+
+    # (i) watermark read-back == matches_expected, bound to THIS row's auction.
+    row_auction = _auction_text(row.get("auction_number"))
+    if not row_auction:
+        blockers.append("no_auction_number")
+    verdict = _clean_str(api.get("mazi_watermark_verification")).lower()
+    if verdict not in PRIVATE_TRUSTED_READBACK_OK:
+        blockers.append(f"watermark_not_read_back:{verdict or 'unread'}")
+    scan_auction = _auction_text(api.get("mazi_watermark_auction_number"))
+    if row_auction and scan_auction and scan_auction != row_auction:
+        blockers.append("watermark_auction_ne_row")
+    expected = _auction_text(stamp.get("expected_auction_number"))
+    if row_auction and expected and expected != row_auction:
+        blockers.append("expected_auction_ne_row")
+
+    # A banned seller hard-blocks every ->Trusted path; keep this one aligned.
+    if _clean_str(row.get("seller")).lower() in _PRIVATE_TRUSTED_BANNED_SELLERS:
+        blockers.append("banned_seller")
+    return sorted(set(blockers))
+
+
+# Mirror of trusted_gate.BANNED_SELLERS / promotion._PENDING_BANNED_SELLERS.
+_PRIVATE_TRUSTED_BANNED_SELLERS = frozenset({
+    "kksportscards", "collectiblescloset", "tripp_cards",
+})
+
+
+def private_trusted_payload(
+    row: dict[str, Any],
+    *,
+    reviewer: str,
+    notes: Any = None,
+    visual_confirmed: bool,
+) -> dict[str, Any]:
+    """The review_decision_events payload for the private-Trusted action.
+
+    Audit-logs reviewer identity and the exact evidence the decision rested on.
+    Contains NO private values (no buyer/winner/bidder/chat/handles) — only the
+    row's own auction binding and the review-frame basename.
+    """
+    raw = _raw_of(row)
+    api = raw.get("api_scan") if isinstance(raw.get("api_scan"), dict) else {}
+    reviewer = _clean_str(reviewer) or DEFAULT_OPERATOR
+    return {
+        "source_key": _clean_str(row.get("source_key")),
+        "comp_id": _clean_str(row.get("comp_id")) or None,
+        "observed_in": resolve_source_view(row) or None,
+        "review_id": _clean_str(row.get("review_id")) or None,
+        "source_file": _clean_str(row.get("source_file")) or None,
+        "auction_number": row.get("auction_number"),
+        "decision": PRIVATE_TRUSTED_DECISION,
+        "reviewer": reviewer,
+        "notes": _clean_str(notes) or None,
+        "row_meta": {
+            "private_state": PRIVATE_TRUSTED_DECISION,
+            "basis": "watermark_readback_plus_human_visual",
+            # Restated on every event so the audit row is self-describing.
+            "public_ready": False,
+            "mazified": False,
+            "is_cert": False,
+            "public_mazidex_eligible": False,
+            "auto_promotable": False,
+            "watermark_verification": _clean_str(api.get("mazi_watermark_verification")) or None,
+            "watermark_auction_number": _auction_text(api.get("mazi_watermark_auction_number")) or None,
+            "row_auction_number": _auction_text(row.get("auction_number")) or None,
+            "front_image_status": _clean_str(raw.get("front_image_status")) or None,
+            "review_front_basename": os.path.basename(
+                _clean_str(row.get("image_review_front"))
+            ) or None,
+            "visual_confirmed": bool(visual_confirmed),
+            "visual_confirmed_by": reviewer,
+            "visual_confirmed_at": _utc_now_iso(),
+        },
+    }
