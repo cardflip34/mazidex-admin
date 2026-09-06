@@ -585,7 +585,14 @@ def refresh_stage1_views(conn_obj: Any) -> None:
             i.grade_chip, i.condition, i.category, i.sport, i.image_front_neon_url,
             i.image_back_neon_url, i.image_front, i.image_back, i.last_sale_date,
             i.pending_reasons, i.warnings, i.review_decision, i.review_notes, i.reviewed_by,
-            i.reviewed_at, i.raw
+            i.reviewed_at, i.raw,
+            -- REVIEW-ONLY front (core-repo migration 025, 2026-09-05). This function is
+            -- the CANONICAL author of identified_sales_current (it DROPs+CREATEs on every
+            -- promotion), so the columns MUST be declared here or they vanish minutes
+            -- after any migration adds them to the live view -- which is exactly what
+            -- happened on 2026-09-05. NOT a trust surface: image_front stays the only
+            -- promotable front; nothing in this module reads image_review_front.
+            i.image_review_front, i.image_review_front_neon_url
         FROM identified_sweep_rows i
         WHERE NOT EXISTS (
             SELECT 1 FROM stage1_trusted_promotion_rows p
@@ -601,7 +608,8 @@ def refresh_stage1_views(conn_obj: Any) -> None:
             h.grade_chip, h.condition, h.category, h.sport, h.image_front_neon_url,
             h.image_back_neon_url, h.image_front, h.image_back, h.last_sale_date,
             h.pending_reasons, h.warnings, h.review_decision, h.review_notes, h.reviewed_by,
-            h.reviewed_at, h.raw
+            h.reviewed_at, h.raw,
+            NULL::text AS image_review_front, NULL::text AS image_review_front_neon_url
         FROM stage1_trusted_historical_resweep_rows h
         WHERE h.stage1_state = 'identified'
           AND NOT EXISTS (
