@@ -107,13 +107,18 @@ def mve_card(sport: str, card_print_id: str):
     conn = _store(sport)
     try:
         run = _latest_run(conn)
-        rows = conn.execute("SELECT grade_key, payload FROM value_estimates WHERE run_id=? AND card_print_id=?",
-                            (run["run_id"], card_print_id)).fetchall()
+        # latest estimate PER (print, grade) across runs — incremental runs only re-value changed keys,
+        # so run-scoped lookups would 404 every untouched card
+        rows = conn.execute(
+            "SELECT grade_key, payload FROM value_estimates WHERE card_print_id=? AND id IN "
+            "(SELECT max(id) FROM value_estimates WHERE card_print_id=? GROUP BY grade_key)",
+            (card_print_id, card_print_id)).fetchall()
         if not rows:
-            raise HTTPException(404, "card_print_id not in the latest run")
+            raise HTTPException(404, "card_print_id has no stored estimate")
         scores = {r["grade_key"]: json.loads(r["payload"]) for r in conn.execute(
-            "SELECT grade_key, payload FROM investment_scores WHERE run_id=? AND card_print_id=?",
-            (run["run_id"], card_print_id)).fetchall()}
+            "SELECT grade_key, payload FROM investment_scores WHERE card_print_id=? AND id IN "
+            "(SELECT max(id) FROM investment_scores WHERE card_print_id=? GROUP BY grade_key)",
+            (card_print_id, card_print_id)).fetchall()}
         out = []
         for r in rows:
             est = json.loads(r["payload"])
