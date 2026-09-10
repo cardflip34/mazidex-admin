@@ -119,12 +119,22 @@ def mve_card(sport: str, card_print_id: str):
             "SELECT grade_key, payload FROM investment_scores WHERE card_print_id=? AND id IN "
             "(SELECT max(id) FROM investment_scores WHERE card_print_id=? GROUP BY grade_key)",
             (card_print_id, card_print_id)).fetchall()}
+        # orphan guard: identity re-keying between runs strands the OLD card_print_id, and latest-per-key
+        # would serve its final estimate forever. Flag rather than hide — this is an internal review panel,
+        # and a visibly stale row is more useful than a missing one.
+        has_evidence = conn.execute(
+            "SELECT 1 FROM sale_observations WHERE card_print_id=? LIMIT 1", (card_print_id,)).fetchone()
         out = []
         for r in rows:
             est = json.loads(r["payload"])
             est["mis"] = scores.get(r["grade_key"])
+            if not has_evidence:
+                est["orphan"] = True
+                est["orphan_note"] = ("No observations remain under this card_print_id — the identity was "
+                                      "re-keyed after this estimate was made. Do not serve this value.")
             out.append(est)
-        return JSONResponse({"run_id": run["run_id"], "card_print_id": card_print_id, "estimates": out})
+        return JSONResponse({"run_id": run["run_id"], "card_print_id": card_print_id,
+                             "orphan": not has_evidence, "estimates": out})
     finally:
         conn.close()
 
