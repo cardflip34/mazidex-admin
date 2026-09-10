@@ -67,9 +67,18 @@ def mve_index():
             run = _latest_run(conn)
             m = run["metrics"]
             sc = m.get("status_counts", {})
+            # under incremental runs `keys` is only what CHANGED that night — showing it alone reads as if
+            # the whole catalog were that small, so report the served universe alongside it
+            served = conn.execute(
+                "SELECT count(*) FROM value_estimates WHERE id IN "
+                "(SELECT max(id) FROM value_estimates GROUP BY card_print_id, grade_key)").fetchone()[0]
+            valued = m.get("valued", m.get("keys"))
+            uni = m.get("targets")
+            scope = (f"{served:,} served" + (f" of {uni:,} in-universe" if uni else "")
+                     + f" · {valued:,} re-valued this run" if valued is not None else f"{served:,} served")
             rows.append(
-                f"<li><b><a href='/mve/{sport}'>{sport}</a></b> — run {run['run_id']} ({run['model_version']}) · "
-                f"keys {m.get('keys', '?')} · ok {sc.get('ok', '?')} · regime {m.get('regime', '?')} · "
+                f"<li><b><a href='/mve/{sport}'>{sport}</a></b> — {scope} · "
+                f"run {run['run_id']} ({run['model_version']}) · regime {m.get('regime', '?')} · "
                 f"<a href='/mve/api/{sport}/latest'>json</a></li>")
         finally:
             conn.close()
