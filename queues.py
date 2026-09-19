@@ -1230,7 +1230,12 @@ QUEUE_COUNTS_SQL = f"""
     FROM (
         SELECT DISTINCT ON (source_key) source_key, decision
         FROM review_decision_events
-        ORDER BY source_key, created_at DESC
+        -- id DESC added 2026-09-19: created_at DEFAULTs to now(), which is the
+        -- TRANSACTION timestamp, so a batch write gives every row the same value
+        -- (128,425 rows share one timestamp; 80 source_keys are tied at their max).
+        -- Without a unique tiebreak each arm resolved the tie independently, so one
+        -- source_key could be counted by two different chips. Matches HIDDEN_EXCLUSION.
+        ORDER BY source_key, created_at DESC, id DESC
     ) latest
     WHERE latest.decision = 'chrome_advanced_to_human_review'
     UNION ALL
@@ -1238,7 +1243,12 @@ QUEUE_COUNTS_SQL = f"""
     FROM (
         SELECT DISTINCT ON (source_key) source_key, decision
         FROM review_decision_events
-        ORDER BY source_key, created_at DESC
+        -- id DESC added 2026-09-19: created_at DEFAULTs to now(), which is the
+        -- TRANSACTION timestamp, so a batch write gives every row the same value
+        -- (128,425 rows share one timestamp; 80 source_keys are tied at their max).
+        -- Without a unique tiebreak each arm resolved the tie independently, so one
+        -- source_key could be counted by two different chips. Matches HIDDEN_EXCLUSION.
+        ORDER BY source_key, created_at DESC, id DESC
     ) latest
     WHERE latest.decision = 'human_confirmed_for_final_gate'
     UNION ALL
@@ -1250,7 +1260,12 @@ QUEUE_COUNTS_SQL = f"""
     FROM (
         SELECT DISTINCT ON (source_key) source_key, decision
         FROM review_decision_events
-        ORDER BY source_key, created_at DESC
+        -- id DESC added 2026-09-19: created_at DEFAULTs to now(), which is the
+        -- TRANSACTION timestamp, so a batch write gives every row the same value
+        -- (128,425 rows share one timestamp; 80 source_keys are tied at their max).
+        -- Without a unique tiebreak each arm resolved the tie independently, so one
+        -- source_key could be counted by two different chips. Matches HIDDEN_EXCLUSION.
+        ORDER BY source_key, created_at DESC, id DESC
     ) latest
     WHERE latest.decision = 'mazified'
     UNION ALL
@@ -1264,7 +1279,12 @@ QUEUE_COUNTS_SQL = f"""
     FROM (
         SELECT DISTINCT ON (source_key) source_key, decision
         FROM review_decision_events
-        ORDER BY source_key, created_at DESC
+        -- id DESC added 2026-09-19: created_at DEFAULTs to now(), which is the
+        -- TRANSACTION timestamp, so a batch write gives every row the same value
+        -- (128,425 rows share one timestamp; 80 source_keys are tied at their max).
+        -- Without a unique tiebreak each arm resolved the tie independently, so one
+        -- source_key could be counted by two different chips. Matches HIDDEN_EXCLUSION.
+        ORDER BY source_key, created_at DESC, id DESC
     ) latest
     WHERE latest.decision IN ('rejected_from_public_path','hidden_from_work_queue')
     UNION ALL
@@ -1276,3 +1296,101 @@ QUEUE_COUNTS_SQL = f"""
     WHERE sold_price IS NULL
       AND {HIDDEN_EXCLUSION}
 """
+
+# ---------------------------------------------------------------------------
+# SINGLE-PASS COUNTS (2026-09-19)
+# QUEUE_COUNTS_SQL above is the SOURCE OF TRUTH for every chip predicate. It is
+# also brutally slow: its relations are VIEWS, so its 16 UNION ALL arms scan
+# operational_pending_sales 8x, identified_sales_current 3x, the review-event
+# DISTINCT ON 4x, and re-run the hidden-exclusion subquery 12x. Measured on M4:
+# 101.6s idle, 227.7s under load -- long enough that the browser's fetch died and
+# the workbench showed "DB ERR (FAILED TO FETCH)".
+#
+# This derives an equivalent single-pass query MECHANICALLY from that text, so a
+# future edit to a chip predicate is picked up automatically and the two can
+# never drift. Each chip's predicate is reused VERBATIM inside COUNT(*) FILTER;
+# the only substitution is the repeated hidden-exclusion block, hoisted into one
+# MATERIALIZED CTE and referenced as "source_key NOT IN (SELECT ... FROM
+# hidden_keys)" -- still NOT IN, because an anti-join would change null
+# semantics. The two DISTINCT ON derived tables are kept SEPARATE: the
+# hidden-exclusion breaks ties on (created_at DESC, id DESC) and the event chips
+# on (created_at DESC) alone. Any parse failure falls back to the original.
+_HIDDEN_KEYS_REF = "source_key NOT IN (SELECT source_key FROM hidden_keys)"
+
+
+def _build_single_pass_counts(original: str) -> str:
+    import re as _re
+    blocks = _re.split(r"\n\s*UNION ALL\s*\n", original.strip())
+    parsed = []
+    for b in blocks:
+        name = _re.search(r"SELECT\s+'([a-z_]+)'", b).group(1)
+        tail = b.split("FROM", 1)[1]
+        rel, pred = tail.split("WHERE", 1) if "WHERE" in tail else (tail, "")
+        pred_fast = pred.strip().replace(HIDDEN_EXCLUSION, _HIDDEN_KEYS_REF)
+        assert pred_fast.replace(_HIDDEN_KEYS_REF, HIDDEN_EXCLUSION) == pred.strip()
+        parsed.append({"name": name, "rel": rel.strip(), "pred": pred_fast})
+
+    by_rel: dict[str, list] = {}
+    for p in parsed:
+        by_rel.setdefault(p["rel"], []).append(p)
+    pend_rel, ident_rel = "operational_pending_sales", "identified_sales_current"
+    trust_rel = "stage1_trusted_sales_current"
+    latest_rel = [r for r in by_rel if r.startswith("(")][0]
+    # Derive the CTE body from the ORIGINAL subquery text: hardcoding it here meant a
+    # future edit to the event subquery would be silently ignored by this builder.
+    latest_body = latest_rel.strip()
+    assert latest_body.startswith("(") and latest_body.endswith("latest")
+    latest_body = latest_body[1:latest_body.rindex(")")].strip()
+    assert "DISTINCT ON (source_key)" in latest_body, "event relation is not the expected DISTINCT ON"
+    assert len(parsed) == 16, f"expected 16 chips, parsed {len(parsed)}"
+
+    def _filters(items):
+        return ",\n".join(
+            f'      COUNT(*) FILTER (WHERE {p["pred"] or "TRUE"}\n      ) AS {p["name"]}'
+            for p in items
+        )
+
+    head = f"""WITH hidden_keys AS MATERIALIZED (
+    SELECT le.source_key FROM (
+        SELECT DISTINCT ON (source_key) source_key, decision
+        FROM review_decision_events
+        ORDER BY source_key, created_at DESC, id DESC
+    ) le
+    WHERE le.decision IN ('rejected_from_public_path', 'hidden_from_work_queue', 'deleted_from_8504')
+),
+latest_decision AS MATERIALIZED (
+    {latest_body}
+),
+pend AS (
+    SELECT
+{_filters(by_rel[pend_rel])}
+    FROM {pend_rel}
+),
+ident AS (
+    SELECT
+{_filters(by_rel[ident_rel])}
+    FROM {ident_rel}
+),
+trust AS (
+    SELECT
+{_filters(by_rel[trust_rel])}
+    FROM {trust_rel}
+),
+evt AS (
+    SELECT
+{_filters(by_rel[latest_rel])}
+    FROM latest_decision latest
+)"""
+    unpivot = []
+    for cte, items in (("pend", by_rel[pend_rel]), ("ident", by_rel[ident_rel]),
+                       ("trust", by_rel[trust_rel]), ("evt", by_rel[latest_rel])):
+        for p in items:
+            unpivot.append(f"SELECT '{p['name']}' AS name, {cte}.{p['name']}::bigint AS n FROM {cte}")
+    return head + "\n" + "\n    UNION ALL ".join(unpivot) + "\n"
+
+
+try:
+    QUEUE_COUNTS_FAST_SQL = _build_single_pass_counts(QUEUE_COUNTS_SQL)
+except Exception:  # never let a parse change take the workbench down
+    QUEUE_COUNTS_FAST_SQL = QUEUE_COUNTS_SQL
+

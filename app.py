@@ -17,7 +17,7 @@ import urllib.request
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread, local as _thread_local
 from time import monotonic
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -95,6 +95,7 @@ from queues import (
     external_total_where,
     EXTERNAL_SQL_MAP,
     QUEUE_COUNTS_SQL,
+    QUEUE_COUNTS_FAST_SQL,
     QUEUE_MAP,
     ROW_DETAIL_SQL,
     ROW_BY_SOURCE_KEY_SQL,
@@ -134,12 +135,108 @@ WHATNOT_DIR = Path.home() / "whatnot-sniper-m4"
 LIVE_AUCTION_LEDGER_PATH = WHATNOT_DIR / "ops" / "whatnot_auctions_live_append.jsonl"
 _PRICE_AUDIT_CACHE_LOCK = Lock()
 _PRICE_AUDIT_CACHE: dict[str, Any] = {"key": None, "payload": None, "expires_at": 0.0}
-QUEUE_COUNTS_CACHE_TTL_SECONDS = 30.0
+# 2026-09-18: TTL must exceed the query cost, or the refresher runs forever.
+# QUEUE_COUNTS_SQL costs minutes cold (about ten COUNT(*)s over 378k rows), so a
+# 30s TTL meant a near-permanent background recompute that starved the row
+# queries (trusted_view went from ~3s to >90s). Tab chips tolerate staleness.
+QUEUE_COUNTS_CACHE_TTL_SECONDS = float(os.environ.get("MAZI_8504_COUNTS_CACHE_TTL_SECONDS", "900"))
 _QUEUE_COUNTS_CACHE_LOCK = Lock()
 _QUEUE_COUNTS_CACHE: dict[str, Any] = {
     "expires_at": 0.0,
     "payload": None,
 }
+# 2026-09-18: the workbench showed "DB ERR (FAILED TO FETCH)" + "WRITES CLOSED /
+# HEALTH UNKNOWN" while this server was healthy (health 200, db_ok, writes
+# enabled). Cause: the header runs five COUNT(*)s with no cache and no bound --
+# the pending count alone is ~14s over 378k rows, the whole header 16-17s, and
+# the tab counts exceeded 120s cold while the M4 was at load 30 -- so the
+# browser's fetch died before the response and the page's catch blocks painted
+# those banners. Fix: cache the header like the tab counts, bound both with a
+# server-side statement timeout, and serve the last good payload when a refresh
+# times out. Stale beats blank: a zeroed header reads as "the pipeline is empty".
+# Same rule as the counts TTL: it must exceed the query cost by a wide margin.
+# The header's 5 view-scans measured 16-21s idle but >100s under lane contention,
+# so a 300s TTL still meant near-continuous recompute.
+HEADER_CACHE_TTL_SECONDS = float(os.environ.get("MAZI_8504_HEADER_CACHE_TTL_SECONDS", "900"))
+# Applies to the BACKGROUND refresh only -- a browser request is answered from
+# cache and never waits on these counts. 20s was too tight: on a loaded M4 the
+# header needs >20s and every call then failed, which is worse than slow.
+# 120s was still shorter than the cold cost, so every background refresh was
+# cancelled and retried forever -- a permanently running count query and numbers
+# that never refreshed. Give the refresh room to finish once; it then serves from
+# cache for QUEUE_COUNTS_CACHE_TTL_SECONDS and the database goes quiet.
+COUNTS_STATEMENT_TIMEOUT_MS = int(os.environ.get("MAZI_8504_COUNTS_TIMEOUT_MS", "600000"))
+_HEADER_CACHE_LOCK = Lock()
+_HEADER_CACHE: dict[str, dict[str, Any]] = {}
+_REFRESH_INFLIGHT_LOCK = Lock()
+_REFRESH_INFLIGHT: set[str] = set()
+_BYPASS_CACHE = _thread_local()
+# Persist the computed counts so a restart starts with real numbers. Recomputing
+# QUEUE_COUNTS_SQL cold costs minutes (about ten COUNT(*)s over a 378k-row table
+# with jsonb predicates), and until it lands every request would otherwise block.
+COUNT_CACHE_FILE = os.environ.get(
+    "MAZI_8504_COUNT_CACHE_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "count_cache.json"),
+)
+
+
+def _persist_count_caches() -> None:
+    try:
+        os.makedirs(os.path.dirname(COUNT_CACHE_FILE), exist_ok=True)
+        with _QUEUE_COUNTS_CACHE_LOCK:
+            counts = _QUEUE_COUNTS_CACHE.get("payload")
+        with _HEADER_CACHE_LOCK:
+            header = {k: v.get("payload") for k, v in _HEADER_CACHE.items() if v.get("payload")}
+        tmp = COUNT_CACHE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump({"counts": counts, "header": header}, fh)
+        os.replace(tmp, COUNT_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _load_persisted_count_caches() -> None:
+    """Seed both caches from disk as ALREADY STALE: served instantly, refreshed behind."""
+    try:
+        with open(COUNT_CACHE_FILE) as fh:
+            blob = json.load(fh)
+    except Exception:
+        return
+    counts = blob.get("counts")
+    if counts:
+        with _QUEUE_COUNTS_CACHE_LOCK:
+            _QUEUE_COUNTS_CACHE["payload"] = counts
+            _QUEUE_COUNTS_CACHE["expires_at"] = 0.0
+    for obo, payload in (blob.get("header") or {}).items():
+        if payload:
+            with _HEADER_CACHE_LOCK:
+                _HEADER_CACHE[obo] = {"payload": payload, "expires_at": 0.0}
+
+
+def _cache_bypassed() -> bool:
+    """True inside a background refresh, so it recomputes instead of self-serving."""
+    return bool(getattr(_BYPASS_CACHE, "on", False))
+
+
+def _spawn_refresh(key: str, fn, *args) -> None:
+    """Recompute one cached payload off the request path, one worker per key."""
+    with _REFRESH_INFLIGHT_LOCK:
+        if key in _REFRESH_INFLIGHT:
+            return
+        _REFRESH_INFLIGHT.add(key)
+
+    def _run() -> None:
+        try:
+            _BYPASS_CACHE.on = True
+            fn(*args)
+        except Exception:
+            pass
+        finally:
+            _BYPASS_CACHE.on = False
+            with _REFRESH_INFLIGHT_LOCK:
+                _REFRESH_INFLIGHT.discard(key)
+
+    Thread(target=_run, daemon=True).start()
 IMAGE_PROXY_TIMEOUT_SECONDS = float(os.environ.get("MAZI_8504_IMAGE_PROXY_TIMEOUT_SECONDS", "10"))
 IMAGE_PROXY_CACHE_TTL_SECONDS = float(os.environ.get("MAZI_8504_IMAGE_PROXY_CACHE_TTL_SECONDS", "300"))
 IMAGE_PROXY_CACHE_MAX_ITEMS = int(os.environ.get("MAZI_8504_IMAGE_PROXY_CACHE_MAX_ITEMS", "512"))
@@ -1783,36 +1880,56 @@ def health() -> dict[str, Any]:
 @app.get("/api/v1/queue/counts")
 def queue_counts() -> dict[str, Any]:
     now = monotonic()
+    # NOTE: the lock guards the cache only. It used to wrap the query too, so
+    # concurrent page loads queued behind one multi-minute statement.
     with _QUEUE_COUNTS_CACHE_LOCK:
         cached = _QUEUE_COUNTS_CACHE.get("payload")
-        if cached and now < float(_QUEUE_COUNTS_CACHE.get("expires_at") or 0.0):
-            return {**cached, "cache": "hit"}
+        fresh = bool(cached) and now < float(_QUEUE_COUNTS_CACHE.get("expires_at") or 0.0)
+    if cached and not _cache_bypassed():
+        if not fresh:
+            _spawn_refresh("counts", queue_counts)
+        return {**cached, "cache": "hit" if fresh else "stale"}
 
-        out: dict[str, int] = {name: 0 for name in QUEUE_MAP}
-        generated_at = datetime.now(timezone.utc).isoformat()
-        try:
-            with neon_conn() as c:
-                cur = c.cursor()
-                cur.execute(QUEUE_COUNTS_SQL)
-                for name, n in cur.fetchall():
-                    out[name] = int(n or 0)
-        except Exception as e:
-            return {
-                "counts": out,
-                "error": "counts_failed",
-                "detail": f"{type(e).__name__}: {str(e)[:200]}",
-                "generated_at": generated_at,
-                "cache": "miss",
-            }
-        payload = {
+    out: dict[str, int] = {name: 0 for name in QUEUE_MAP}
+    generated_at = datetime.now(timezone.utc).isoformat()
+    if not _cache_bypassed():
+        # No payload yet (first boot ever). Never hold the request open for a
+        # multi-minute statement -- answer "warming" and compute behind.
+        _spawn_refresh("counts", queue_counts)
+        return {"counts": out, "generated_at": generated_at, "cache": "warming"}
+    try:
+        with neon_conn() as c:
+            cur = c.cursor()
+            cur.execute(f"SET LOCAL statement_timeout = '{COUNTS_STATEMENT_TIMEOUT_MS}ms'")
+            # single-pass rewrite: one COUNT(*) FILTER scan per relation instead of
+            # 16 separate scans over views that re-materialize on every COUNT.
+            # Generated FROM QUEUE_COUNTS_SQL; verified 16/16 identical in one
+            # REPEATABLE READ snapshot 2026-09-19 (118.2s -> 66.7s).
+            cur.execute(QUEUE_COUNTS_FAST_SQL)
+            for name, n in cur.fetchall():
+                out[name] = int(n or 0)
+    except Exception as e:
+        if cached:
+            return {**cached, "cache": "stale", "error": "counts_failed",
+                    "detail": f"{type(e).__name__}: {str(e)[:200]}"}
+        return {
             "counts": out,
+            "error": "counts_failed",
+            "detail": f"{type(e).__name__}: {str(e)[:200]}",
             "generated_at": generated_at,
             "cache": "miss",
-            "ttl_seconds": int(QUEUE_COUNTS_CACHE_TTL_SECONDS),
         }
+    payload = {
+        "counts": out,
+        "generated_at": generated_at,
+        "cache": "miss",
+        "ttl_seconds": int(QUEUE_COUNTS_CACHE_TTL_SECONDS),
+    }
+    with _QUEUE_COUNTS_CACHE_LOCK:
         _QUEUE_COUNTS_CACHE["payload"] = payload
         _QUEUE_COUNTS_CACHE["expires_at"] = monotonic() + QUEUE_COUNTS_CACHE_TTL_SECONDS
-        return payload
+    _persist_count_caches()
+    return payload
 
 
 # ============================================================================
@@ -2065,7 +2182,12 @@ def stats_header(
             SELECT COUNT(*) AS n FROM (
                 SELECT DISTINCT ON (source_key) source_key, decision
                 FROM review_decision_events
-                ORDER BY source_key, created_at DESC
+                -- id DESC (2026-09-19): created_at DEFAULTs to the TRANSACTION
+                -- timestamp, so batch writes leave rows tied (80 source_keys are
+                -- tied at their newest). Without a unique tiebreak this picks an
+                -- arbitrary winner and stops reconciling with the tab counts,
+                -- which this header claims to match "by construction".
+                ORDER BY source_key, created_at DESC, id DESC
             ) latest
             WHERE latest.decision = 'mazified'
         ),
@@ -2080,9 +2202,24 @@ def stats_header(
         FROM pending, identified, trusted, mazified, external
     """
     sql = sql.format(ext_where=external_total_where(obo == "exclude"))
+    now = monotonic()
+    with _HEADER_CACHE_LOCK:
+        entry = _HEADER_CACHE.get(obo)
+    if entry and entry.get("payload") and not _cache_bypassed():
+        fresh = now < float(entry.get("expires_at") or 0.0)
+        if not fresh:
+            _spawn_refresh(f"header:{obo}", stats_header, obo)
+        return {**entry["payload"], "cache": "hit" if fresh else "stale"}
+    if not _cache_bypassed():
+        # Same rule as queue_counts: no payload yet (first boot, or the persisted
+        # cache was lost) must NOT hold the request open for a multi-minute
+        # statement. Blocking here is what made the page report FAILED TO FETCH.
+        _spawn_refresh(f"header:{obo}", stats_header, obo)
+        return {**out, "cache": "warming"}
     try:
         with neon_conn() as c:
             cur = c.cursor()
+            cur.execute(f"SET LOCAL statement_timeout = '{COUNTS_STATEMENT_TIMEOUT_MS}ms'")
             cur.execute(sql)
             row = cur.fetchone()
         if row:
@@ -2093,9 +2230,20 @@ def stats_header(
             out["mazified_count"]   = int(n_maz or 0)
             out["external_count"]   = int(n_ext or 0)
     except Exception as e:
+        with _HEADER_CACHE_LOCK:
+            entry = _HEADER_CACHE.get(obo)
+        if entry and entry.get("payload"):
+            return {**entry["payload"], "cache": "stale",
+                    "error": "stats_failed",
+                    "detail": f"{type(e).__name__}: {str(e)[:200]}"}
         out["error"] = "stats_failed"
         out["detail"] = f"{type(e).__name__}: {str(e)[:200]}"
-    return out
+        return out
+    with _HEADER_CACHE_LOCK:
+        _HEADER_CACHE[obo] = {"payload": out,
+                              "expires_at": monotonic() + HEADER_CACHE_TTL_SECONDS}
+    _persist_count_caches()
+    return {**out, "cache": "miss"}
 
 
 # ============================================================================
@@ -3126,3 +3274,22 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# 2026-09-18: warm both count caches in the background at boot. Without this the
+# first page load after a restart pays the full cold cost (header ~17-21s, tab
+# counts up to minutes on a loaded box) and the browser's fetch can die first --
+# which is exactly the "DB ERR (FAILED TO FETCH)" the workbench was showing.
+def _prime_count_caches() -> None:
+    for key, fn, args in (("counts", queue_counts, ()), ("header:include", stats_header, ("include",))):
+        try:
+            _BYPASS_CACHE.on = True
+            fn(*args)
+        except Exception:
+            pass
+        finally:
+            _BYPASS_CACHE.on = False
+
+
+_load_persisted_count_caches()
+Thread(target=_prime_count_caches, daemon=True).start()
