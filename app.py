@@ -134,7 +134,11 @@ PT = ZoneInfo("America/Los_Angeles")
 WHATNOT_DIR = Path.home() / "whatnot-sniper-m4"
 LIVE_AUCTION_LEDGER_PATH = WHATNOT_DIR / "ops" / "whatnot_auctions_live_append.jsonl"
 _PRICE_AUDIT_CACHE_LOCK = Lock()
-_PRICE_AUDIT_CACHE: dict[str, Any] = {"key": None, "payload": None, "expires_at": 0.0}
+_PRICE_AUDIT_CACHE: dict[str, Any] = {"key": None, "payload": None, "expires_at": 0.0, "built_at": 0.0}
+# Floor between full re-parses of the 7.44 GB live ledger. The (mtime, size) cache key
+# changes on every importer append, so without a floor a growing file forces a
+# multi-GB parse every 30s forever. Badges are advisory; five minutes stale is fine.
+PRICE_AUDIT_REBUILD_FLOOR_SECONDS = float(os.environ.get("MAZI_8504_PRICE_AUDIT_REBUILD_FLOOR_SECONDS", "300"))
 # 2026-09-18: TTL must exceed the query cost, or the refresher runs forever.
 # QUEUE_COUNTS_SQL costs minutes cold (about ten COUNT(*)s over 378k rows), so a
 # 30s TTL meant a near-permanent background recompute that starved the row
@@ -446,10 +450,30 @@ def _price_audit_payload(day: str | None = None) -> dict[str, Any]:
     file_key = _audit_file_key(LIVE_AUCTION_LEDGER_PATH)
     cache_key = (day, file_key)
     now = monotonic()
+    # 2026-09-22: NEVER parse the ledger on a request thread. This builder reads and
+    # json.loads the ENTIRE live append ledger -- 7.44 GB, 580k lines -- and its cache
+    # key is (mtime, size), which every importer append changes, so in practice the
+    # cache was invalid on almost every request and each of the 200 rows on a page
+    # triggered a fresh multi-GB parse on the request thread (14.8s warm, minutes under
+    # load). Worse, the parse ran OUTSIDE the lock, so the browser's retries parsed it
+    # in parallel; the workbench then timed out for hours while the database was idle.
+    # Now: serve whatever payload exists immediately (stale is fine -- these are
+    # advisory badges), rebuild in ONE background thread, and floor the rebuild
+    # cadence so a growing file cannot make us re-parse it every 30s.
     with _PRICE_AUDIT_CACHE_LOCK:
         cached = _PRICE_AUDIT_CACHE.get("payload")
-        if cached and _PRICE_AUDIT_CACHE.get("key") == cache_key and now < float(_PRICE_AUDIT_CACHE.get("expires_at") or 0.0):
-            return dict(cached)
+        fresh = bool(cached) and _PRICE_AUDIT_CACHE.get("key") == cache_key \
+            and now < float(_PRICE_AUDIT_CACHE.get("expires_at") or 0.0)
+        last_build = float(_PRICE_AUDIT_CACHE.get("built_at") or 0.0)
+    if not _cache_bypassed():
+        if cached:
+            if not fresh and now - last_build > PRICE_AUDIT_REBUILD_FLOOR_SECONDS:
+                _spawn_refresh("price_audit", _price_audit_payload, day)
+            return cached          # shared read-only mapping; callers only .get()
+        # Cold (first boot): kick the build and answer empty -- every row already
+        # falls back to audit_only=True when there is no match.
+        _spawn_refresh("price_audit", _price_audit_payload, day)
+        return {"red": 0, "amber": 0, "by_key": {}, "generated_at": datetime.now(timezone.utc).isoformat(), "warming": True}
 
     sales: dict[str, dict[str, Any]] = {}
     try:
@@ -457,8 +481,8 @@ def _price_audit_payload(day: str | None = None) -> dict[str, Any]:
     except OSError:
         payload = {"red": 0, "amber": 0, "by_key": {}, "generated_at": datetime.now(timezone.utc).isoformat(), "error": "ledger_unavailable"}
         with _PRICE_AUDIT_CACHE_LOCK:
-            _PRICE_AUDIT_CACHE.update({"key": cache_key, "payload": payload, "expires_at": now + 30.0})
-        return dict(payload)
+            _PRICE_AUDIT_CACHE.update({"key": cache_key, "payload": payload, "expires_at": now + 30.0, "built_at": now})
+        return payload
 
     with f:
         for line in f:
@@ -548,8 +572,9 @@ def _price_audit_payload(day: str | None = None) -> dict[str, Any]:
 
     payload = {"red": red, "amber": amber, "by_key": by_key, "generated_at": datetime.now(timezone.utc).isoformat()}
     with _PRICE_AUDIT_CACHE_LOCK:
-        _PRICE_AUDIT_CACHE.update({"key": cache_key, "payload": payload, "expires_at": now + 30.0})
-    return dict(payload)
+        _PRICE_AUDIT_CACHE.update({"key": cache_key, "payload": payload, "expires_at": now + 30.0,
+                                   "built_at": monotonic()})
+    return payload
 
 
 def _apply_price_audit(row: dict[str, Any]) -> None:
