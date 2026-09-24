@@ -531,7 +531,60 @@ def ensure_stage1_promotion_schema(conn_obj: Any) -> None:
     conn_obj.commit()
 
 
-def refresh_stage1_views(conn_obj: Any) -> None:
+STAGE1_VIEW_NAMES = ("stage1_trusted_sales_current", "identified_sales_current")
+
+
+def _stage1_views_fingerprint() -> str:
+    """sha1 of the DDL source below. Any edit to the view text changes it."""
+    import hashlib, inspect
+    return hashlib.sha1(inspect.getsource(_apply_stage1_views).encode()).hexdigest()[:16]
+
+
+def refresh_stage1_views(conn_obj: Any) -> str:
+    """Keep the two live views on the code-owned definition WITHOUT DDL per promotion.
+
+    2026-09-23: _apply_stage1_views DROPs + CREATEs both views, and it ran on EVERY
+    confirm. DROP VIEW takes ACCESS EXCLUSIVE, so each promotion queued behind every
+    reader of these views (the 8504 counts refresh at 65-120s, the workbench rows,
+    TR-4's 600s cohort query) and every new reader queued behind the DROP -- a DDL
+    lock convoy per confirm, 101 of them in the first cycle back. With lock_timeout=0
+    and statement_timeout=45s the DROP eventually died, AFTER the promotion had
+    committed: the client got a 500 for a row that was in fact promoted (45 of 101).
+
+    The views are set-based (identified = sweep rows MINUS promoted rows), so a
+    promotion never needs the definition re-applied. The definition still lives here
+    and still wins: it is fingerprinted and stamped on each view as a COMMENT, and the
+    DDL runs only when the deployed fingerprint differs -- i.e. once per code change.
+    Returns 'current' | 'applied' | 'failed:<reason>'; never raises.
+    """
+    fp = "stage1_views:" + _stage1_views_fingerprint()
+    cur = conn_obj.cursor()
+    try:
+        cur.execute(
+            "SELECT obj_description(to_regclass(%s), 'pg_class'), obj_description(to_regclass(%s), 'pg_class')",
+            STAGE1_VIEW_NAMES,
+        )
+        if tuple(cur.fetchone() or ()) == (fp, fp):
+            return "current"
+    except Exception as exc:  # to_regclass on a missing view yields NULL, not an error; this is a real fault
+        conn_obj.rollback()
+        return f"failed:probe:{type(exc).__name__}"
+    try:
+        # Bounded wait: never let a definition refresh convoy the workbench for minutes.
+        cur.execute("SET LOCAL lock_timeout = '10s'")
+        _apply_stage1_views(conn_obj)          # DROP + CREATE + commit, unchanged
+        for name in STAGE1_VIEW_NAMES:
+            cur.execute(f"COMMENT ON VIEW {name} IS %s", (fp,))
+        conn_obj.commit()
+        print(f"[stage1_views] definition applied ({fp})", flush=True)
+        return "applied"
+    except Exception as exc:
+        conn_obj.rollback()
+        print(f"[stage1_views] refresh FAILED {type(exc).__name__}: {str(exc)[:200]}", flush=True)
+        return f"failed:{type(exc).__name__}"
+
+
+def _apply_stage1_views(conn_obj: Any) -> None:
     cur = conn_obj.cursor()
     cur.execute("DROP VIEW IF EXISTS identified_sales_current")
     cur.execute("DROP VIEW IF EXISTS stage1_trusted_sales_current")
@@ -816,8 +869,11 @@ def promote_to_trusted(
     )
     promotion_id, promoted_at = cur.fetchone()
     conn_obj.commit()
-    refresh_stage1_views(conn_obj)
+    # The promotion is committed above. A view-definition refresh failing here must NOT
+    # turn into a 500: the client would record a promoted row as not promoted.
+    view_refresh = refresh_stage1_views(conn_obj)
     return {
+        "view_refresh": view_refresh,
         "event_id": int(event_id),
         "event_created_at": str(event_at),
         "promotion_id": int(promotion_id),
