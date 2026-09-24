@@ -2700,9 +2700,16 @@ async def review_decision(request: Request) -> JSONResponse:
                            "unknown_decision",
                            "missing_decision")):
             return _json({"error": "unsupported_decision", "reason": msg}, status_code=422)
+        # 2026-09-23: both promotion lanes were refused here with nothing recorded but the
+        # status code. Log the reason so a rejection is diagnosable from the server log.
+        print(f"[review-decision] 400 {msg} comp_id={str((body or {}).get('comp_id'))[:60]} "
+              f"decision={(body or {}).get('decision') or (body or {}).get('decision_type')}", flush=True)
         return _json({"error": msg}, status_code=400)
     except Exception as e:
         type_name = type(e).__name__
+        import traceback as _tb
+        print(f"[review-decision] 500 {type_name}: {str(e)[:300]} comp_id={str((body or {}).get('comp_id'))[:60]}\n"
+              + ''.join(_tb.format_exception(e))[-1500:], flush=True)
         if "CheckViolation" in type_name or "IntegrityError" in type_name:
             return _json(
                 {
