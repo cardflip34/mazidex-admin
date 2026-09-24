@@ -783,9 +783,15 @@ def proxy_image(path: str) -> Response:
         print(f"image_proxy source=cache path={source_path}", flush=True)
         return Response(content=body, media_type=content_type)
 
+    # 2026-09-23: local 9008 BEFORE R2. R2-first cost ~14s per image on a front the 9008
+    # server returns in 3ms (measured), because _fetch_r2 pays a credentialed S3 round
+    # trip (and its client setup) before the local tier is even tried. Two consequences:
+    # every image on every review page waited on R2, and promotion.py's displayability
+    # gate -- a 3s self-probe of this proxy -- refused VALID fronts as "no_response" in
+    # both promotion lanes. R2 stays as the fallback for fronts archived off this box.
     for source_name, fetcher in (
-        ("r2", _fetch_r2),
         ("9008", _fetch_9008),
+        ("r2", _fetch_r2),
         ("local", _fetch_local),
     ):
         fetched = fetcher(source_path, tail)
