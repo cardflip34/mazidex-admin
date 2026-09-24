@@ -540,6 +540,18 @@ def _stage1_views_fingerprint() -> str:
     return hashlib.sha1(inspect.getsource(_apply_stage1_views).encode()).hexdigest()[:16]
 
 
+def _stamp_stage1_views(conn_obj: Any, fp: str) -> None:
+    """COMMENT ON is a utility statement: it cannot take a bound parameter (the first
+    deploy failed 12/12 with 'syntax error at or near "$1"'), so the literal is quoted
+    with psycopg.sql. Bounded by lock_timeout like the DDL it follows."""
+    from psycopg import sql as _sql
+    cur = conn_obj.cursor()
+    cur.execute("SET LOCAL lock_timeout = '10s'")
+    for name in STAGE1_VIEW_NAMES:
+        cur.execute(_sql.SQL("COMMENT ON VIEW {} IS {}").format(_sql.Identifier(name), _sql.Literal(fp)))
+    conn_obj.commit()
+
+
 def refresh_stage1_views(conn_obj: Any) -> str:
     """Keep the two live views on the code-owned definition WITHOUT DDL per promotion.
 
@@ -573,9 +585,7 @@ def refresh_stage1_views(conn_obj: Any) -> str:
         # Bounded wait: never let a definition refresh convoy the workbench for minutes.
         cur.execute("SET LOCAL lock_timeout = '10s'")
         _apply_stage1_views(conn_obj)          # DROP + CREATE + commit, unchanged
-        for name in STAGE1_VIEW_NAMES:
-            cur.execute(f"COMMENT ON VIEW {name} IS %s", (fp,))
-        conn_obj.commit()
+        _stamp_stage1_views(conn_obj, fp)
         print(f"[stage1_views] definition applied ({fp})", flush=True)
         return "applied"
     except Exception as exc:
