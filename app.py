@@ -34,6 +34,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.concurrency import run_in_threadpool
 
 
 def _json(content: Any, status_code: int = 200) -> JSONResponse:
@@ -2578,6 +2579,9 @@ def decisions_for(comp_id: str) -> dict[str, Any]:
 # ============================================================================
 # Decision write (DISABLED at v0)
 # ============================================================================
+_CONFIRM_LOCK = Lock()
+
+
 @app.post("/api/v1/review-decision")
 async def review_decision(request: Request) -> JSONResponse:
     """Append-only decision write. Gated CLOSED at v0.
@@ -2668,34 +2672,41 @@ async def review_decision(request: Request) -> JSONResponse:
     # Identified -> Trusted promotion with watermark-bound proof. Other
     # decisions stay closed until explicitly approved.
     try:
-        with neon_conn() as c:
-            if decision == "confirm":
-                # Try Identified->Trusted first; if the row isn't in Identified,
-                # fall back to the Pending->Trusted gate (watermark + single-card
-                # + identity, no cert). The Identified attempt does no writes
-                # before raising not_in_identified_state (only an idempotent
-                # schema-ensure commit + a SELECT), so the connection is clean
-                # for the fallback. The pending gate self-enforces eligibility.
+        if decision != "confirm":
+            return _json(
+                {
+                    "error": "write_scope_closed",
+                    "message": (
+                        "The current write gate is scoped to Confirm "
+                        "Identified->Trusted promotion only. Public, "
+                        "Mazified, flag/reject/clear/workable writes are closed."
+                    ),
+                    "decision": decision,
+                },
+                status_code=403,
+            )
+
+        def _confirm() -> dict[str, Any]:
+            # Try Identified->Trusted first; if the row isn't in Identified,
+            # fall back to the Pending->Trusted gate (watermark + single-card
+            # + identity, no cert). The Identified attempt does no writes
+            # before raising not_in_identified_state (only an idempotent
+            # schema-ensure commit + a SELECT), so the connection is clean
+            # for the fallback. The pending gate self-enforces eligibility.
+            with _CONFIRM_LOCK, neon_conn() as c:
                 try:
-                    result = promote_identified_to_trusted(c, body)
+                    return promote_identified_to_trusted(c, body)
                 except ValueError as identified_exc:
                     if str(identified_exc) == "not_in_identified_state":
-                        result = promote_pending_to_trusted(c, body)
-                    else:
-                        raise
-            else:
-                return _json(
-                    {
-                        "error": "write_scope_closed",
-                        "message": (
-                            "The current write gate is scoped to Confirm "
-                            "Identified->Trusted promotion only. Public, "
-                            "Mazified, flag/reject/clear/workable writes are closed."
-                        ),
-                        "decision": decision,
-                    },
-                    status_code=403,
-                )
+                        return promote_pending_to_trusted(c, body)
+                    raise
+
+        # 2026-09-25: the promotion runs OFF the event loop. Run inline, it blocked the
+        # loop, and the displayability gate's HTTP self-probe of /proxy/image/ (any front
+        # not on local disk) could not be served until this handler returned -- so it
+        # timed out every time and valid fronts were refused as "no_response" (one key
+        # 186x). _CONFIRM_LOCK keeps confirms serialized, as the blocked loop did.
+        result = await run_in_threadpool(_confirm)
         return _json(deep_scrub(result), status_code=201)
     except PermissionError:
         return _json({"error": "review_write_disabled"}, status_code=503)
