@@ -24,7 +24,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 MVE_ROOT = Path(os.environ.get("MVE_ROOT", os.path.expanduser("~/MAZI-VALUE-ESTIMATE")))
 DATA = MVE_ROOT / "data"
 PRIVATE = MVE_ROOT / "docs" / "private"
-SPORTS = ("football", "basketball")
+# every sport the nightly publishes (MAZI-VALUE-ESTIMATE ops/mve_sports.txt); soccer was missing from 09-04
+SPORTS = ("football", "basketball", "soccer", "baseball", "hockey")
 
 mve_router = APIRouter(prefix="/mve", tags=["mve"])
 
